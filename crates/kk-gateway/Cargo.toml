@@ -8,6 +8,10 @@ license.workspace = true
 name = "kk-gateway"
 path = "src/main.rs"
 
+[lib]
+name = "kk_gateway"
+path = "src/lib.rs"
+
 [dependencies]
 kk-core = { workspace = true }
 tokio = { workspace = true }
@@ -20,3 +24,7 @@ k8s-openapi = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
+filetime = "0.2"

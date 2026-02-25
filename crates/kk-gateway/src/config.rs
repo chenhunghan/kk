@@ -20,6 +20,8 @@ pub struct GatewayConfig {
     pub cleanup_interval_ms: u64,
     pub stale_message_timeout: u64,
     pub results_archive_ttl: u64,
+    pub pvc_claim_name: String,
+    pub state_reload_interval_ms: u64,
 }
 
 impl GatewayConfig {
@@ -42,6 +44,8 @@ impl GatewayConfig {
             cleanup_interval_ms: env_u64("CLEANUP_INTERVAL", 60000),
             stale_message_timeout: env_u64("STALE_MESSAGE_TIMEOUT", 300),
             results_archive_ttl: env_u64("RESULTS_ARCHIVE_TTL", 86400),
+            pvc_claim_name: env::var("PVC_CLAIM_NAME").unwrap_or_else(|_| "kk-data".into()),
+            state_reload_interval_ms: env_u64("STATE_RELOAD_INTERVAL", 30000),
         }
     }
 }
