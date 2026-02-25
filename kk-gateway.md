@@ -1,7 +1,7 @@
 # kk-gateway
 
 > **Crate:** `crates/kk-gateway` — Rust, async (tokio)
-> **Cross-references:** [Protocol](kubeclaw-protocol.md) · [Controller](kk-controller.md) · [Connector](kk-connector.md) · [Agent Job](kubeclaw-plan-agent-job.md) · [Skill](kubeclaw-plan-skill.md)
+> **Cross-references:** [Protocol](kubeclaw-protocol.md) · [Controller](kk-controller.md) · [Connector](kk-connector.md) · [Agent Job](kk-agent.md) · [Skill](kubeclaw-plan-skill.md)
 
 ---
 

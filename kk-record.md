@@ -286,7 +286,7 @@ Full kk-gateway implementation + e2e tests + bug fix + documentation update.
 | `kk-controller.md` | Updated (reflects implementation) |
 | `kk-connector.md` | Updated (reflects implementation) |
 | `kk-gateway.md` | Updated (reflects implementation) |
-| `kubeclaw-plan-agent-job.md` | Original (not yet renamed/implemented) |
+| `kk-agent.md` | Architecture doc (reflects implementation) |
 | `kubeclaw-plan-skill.md` | Original (not yet renamed/implemented) |
 
 ### What Remains

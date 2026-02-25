@@ -4,7 +4,7 @@
 > [Communication Protocol](kk-protocol.md) — message formats §4.1, §4.2; nq conventions §2; polling intervals §7
 > [Controller](kk-controller.md) — creates Connector Deployments
 > [Gateway](kubeclaw-plan-gateway.md) — reads inbound queue, writes outbox queue
-> [Agent Job](kubeclaw-plan-agent-job.md) ·
+> [Agent Job](kk-agent.md) ·
 > [Skill](kubeclaw-plan-skill.md)
 
 ---
