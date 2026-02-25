@@ -3,7 +3,6 @@ mod loops;
 mod state;
 
 use anyhow::Result;
-use axum::{Router, routing::get};
 use kube::Client;
 use tracing::info;
 
@@ -23,20 +22,14 @@ async fn main() -> Result<()> {
     let state = SharedState::new(config.clone(), client.clone(), &paths)?;
 
     let shared = state.clone();
-    let health_router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }))
-        .route(
-            "/status",
-            get(move || {
-                let s = shared.clone();
-                async move { s.status_json().await }
-            }),
-        );
+    let mut health = kk_core::health::HealthServer::new(8082);
+    health.route("/status", move || {
+        let s = shared.clone();
+        async move { s.status_json().await }
+    });
 
     let health_server = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8082").await.unwrap();
-        axum::serve(listener, health_router).await.unwrap();
+        health.run().await.unwrap();
     });
 
     info!("health server listening on :8082");

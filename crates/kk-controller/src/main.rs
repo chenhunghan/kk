@@ -1,6 +1,6 @@
 use anyhow::Result;
-use axum::{Router, routing::get};
 use kk_controller::{config::ControllerConfig, reconcilers};
+use kk_core::health::HealthServer;
 use kk_core::paths::DataPaths;
 use kube::Client;
 use tracing::info;
@@ -22,13 +22,9 @@ async fn main() -> Result<()> {
     data_paths.ensure_dirs()?;
 
     let client = Client::try_default().await?;
-    let health_router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }));
 
     let health_server = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8081").await.unwrap();
-        axum::serve(listener, health_router).await.unwrap();
+        HealthServer::new(8081).run().await.unwrap();
     });
 
     info!("health server listening on :8081");

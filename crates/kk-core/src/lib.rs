@@ -1,3 +1,4 @@
+pub mod health;
 pub mod logging;
 pub mod nq;
 pub mod paths;
