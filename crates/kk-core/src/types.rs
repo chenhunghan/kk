@@ -99,6 +99,7 @@ pub enum ChannelType {
     Whatsapp,
     Slack,
     Discord,
+    Github,
     Signal,
 }
 

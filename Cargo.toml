@@ -45,6 +45,9 @@ futures-util = "0.3"
 # Async trait (for dyn-safe async trait methods)
 async-trait = "0.1"
 
+# HTTP framework (webhook servers)
+axum = "0.8"
+
 # Misc
 uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }

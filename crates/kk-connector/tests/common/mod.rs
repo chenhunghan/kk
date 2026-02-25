@@ -68,6 +68,14 @@ impl TestHarness {
             telegram_bot_token: None,
             slack_bot_token: None,
             slack_app_token: None,
+            discord_bot_token: None,
+            github_token: None,
+            github_webhook_secret: None,
+            github_webhook_port: 8084,
+            whatsapp_token: None,
+            whatsapp_phone_number_id: None,
+            whatsapp_webhook_verify_token: None,
+            whatsapp_webhook_port: 8085,
             outbound_poll_interval_ms: 1_000,
         };
 

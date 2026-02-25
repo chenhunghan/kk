@@ -145,6 +145,12 @@ pub async fn poll_stream(stream_dir: &str, sender: &dyn ChatProvider) -> Result<
             let result = sender.send(&msg).await;
             let _ = std::fs::remove_file(entry.path());
             result
+        } else if !sender.supports_edit() {
+            // Provider doesn't support editing (e.g. WhatsApp) — skip intermediate
+            // updates. The stream file will be overwritten until final, at which
+            // point it falls into the "final without prior streaming" path above.
+            debug!(session_id, "skipping stream intermediate (no edit support)");
+            continue;
         } else {
             // First streaming message — start stream or send new
             let start_result = if native {

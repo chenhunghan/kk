@@ -1,5 +1,8 @@
+pub mod discord;
+pub mod github;
 pub mod slack;
 pub mod telegram;
+pub mod whatsapp;
 
 use anyhow::Result;
 use async_trait::async_trait;
@@ -51,6 +54,13 @@ pub trait ChatProvider: Send + Sync {
     /// Edit a previously sent message by its platform-specific ID.
     /// Used for streaming: updates the same message with new partial content.
     async fn edit(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()>;
+
+    /// Whether this provider supports editing sent messages.
+    /// Default: true — most platforms support edit-in-place.
+    /// WhatsApp returns false since it has no edit API.
+    fn supports_edit(&self) -> bool {
+        true
+    }
 
     /// Whether this provider supports native streaming (e.g. Slack).
     /// Default: false — use edit-in-place fallback.

@@ -10,8 +10,11 @@ use kk_connector::inbound::process_inbound;
 use kk_connector::outbound::{poll_outbound, poll_stream};
 use kk_connector::provider::ChatProvider;
 use kk_connector::provider::ConnectorEvent;
+use kk_connector::provider::discord::DiscordProvider;
+use kk_connector::provider::github::GithubProvider;
 use kk_connector::provider::slack::SlackProvider;
 use kk_connector::provider::telegram::TelegramProvider;
+use kk_connector::provider::whatsapp::WhatsappProvider;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -41,46 +44,117 @@ async fn main() -> Result<()> {
     let (inbound_tx, inbound_rx) = mpsc::channel::<ConnectorEvent>(256);
 
     // Initialize provider-specific inbound dispatcher and outbound sender
-    let (inbound_handle, sender): (JoinHandle<()>, Box<dyn ChatProvider>) =
-        match config.channel_type.as_str() {
-            "telegram" => {
-                let token = config
-                    .telegram_bot_token
-                    .as_deref()
-                    .context("TELEGRAM_BOT_TOKEN required for telegram channel type")?;
+    let (inbound_handle, sender): (JoinHandle<()>, Box<dyn ChatProvider>) = match config
+        .channel_type
+        .as_str()
+    {
+        "telegram" => {
+            let token = config
+                .telegram_bot_token
+                .as_deref()
+                .context("TELEGRAM_BOT_TOKEN required for telegram channel type")?;
 
-                let telegram = TelegramProvider::new(token).await?;
-                let sender = Box::new(telegram.sender());
-                info!(bot_username = telegram.bot_username(), "bot identity");
+            let telegram = TelegramProvider::new(token).await?;
+            let sender = Box::new(telegram.sender());
+            info!(bot_username = telegram.bot_username(), "bot identity");
 
-                let handle = tokio::spawn(async move {
-                    telegram.run_inbound(inbound_tx).await;
-                });
+            let handle = tokio::spawn(async move {
+                telegram.run_inbound(inbound_tx).await;
+            });
 
-                (handle, sender)
-            }
-            "slack" => {
-                let bot_token = config
-                    .slack_bot_token
-                    .as_deref()
-                    .context("SLACK_BOT_TOKEN required for slack channel type")?;
-                let app_token = config
-                    .slack_app_token
-                    .as_deref()
-                    .context("SLACK_APP_TOKEN required for slack channel type")?;
+            (handle, sender)
+        }
+        "slack" => {
+            let bot_token = config
+                .slack_bot_token
+                .as_deref()
+                .context("SLACK_BOT_TOKEN required for slack channel type")?;
+            let app_token = config
+                .slack_app_token
+                .as_deref()
+                .context("SLACK_APP_TOKEN required for slack channel type")?;
 
-                let slack = SlackProvider::new(bot_token, app_token).await?;
-                info!(bot_user_id = slack.bot_user_id(), "bot identity");
-                let sender = Box::new(slack.sender());
+            let slack = SlackProvider::new(bot_token, app_token).await?;
+            info!(bot_user_id = slack.bot_user_id(), "bot identity");
+            let sender = Box::new(slack.sender());
 
-                let handle = tokio::spawn(async move {
-                    slack.run_inbound(inbound_tx).await;
-                });
+            let handle = tokio::spawn(async move {
+                slack.run_inbound(inbound_tx).await;
+            });
 
-                (handle, sender)
-            }
-            other => bail!("unsupported channel type: {other} (supported: telegram, slack)"),
-        };
+            (handle, sender)
+        }
+        "discord" => {
+            let token = config
+                .discord_bot_token
+                .as_deref()
+                .context("DISCORD_BOT_TOKEN required for discord channel type")?;
+
+            let discord = DiscordProvider::new(token).await?;
+            info!(bot_user_id = discord.bot_user_id(), "bot identity");
+            let sender = Box::new(discord.sender());
+
+            let handle = tokio::spawn(async move {
+                discord.run_inbound(inbound_tx).await;
+            });
+
+            (handle, sender)
+        }
+        "github" => {
+            let token = config
+                .github_token
+                .as_deref()
+                .context("GITHUB_TOKEN required for github channel type")?;
+
+            let github = GithubProvider::new(
+                token,
+                config.github_webhook_port,
+                config.github_webhook_secret.clone(),
+            )
+            .await?;
+            info!(bot_login = github.bot_login(), "bot identity");
+            let sender = Box::new(github.sender());
+
+            let handle = tokio::spawn(async move {
+                github.run_inbound(inbound_tx).await;
+            });
+
+            (handle, sender)
+        }
+        "whatsapp" => {
+            let token = config
+                .whatsapp_token
+                .as_deref()
+                .context("WHATSAPP_TOKEN required for whatsapp channel type")?;
+            let phone_number_id = config
+                .whatsapp_phone_number_id
+                .as_deref()
+                .context("WHATSAPP_PHONE_NUMBER_ID required for whatsapp channel type")?;
+            let verify_token = config
+                .whatsapp_webhook_verify_token
+                .as_deref()
+                .context("WHATSAPP_WEBHOOK_VERIFY_TOKEN required for whatsapp channel type")?;
+
+            let whatsapp = WhatsappProvider::new(
+                token,
+                phone_number_id,
+                config.whatsapp_webhook_port,
+                verify_token,
+            )
+            .await?;
+            info!(phone_number_id = whatsapp.phone_number_id(), "bot identity");
+            let sender = Box::new(whatsapp.sender());
+
+            let handle = tokio::spawn(async move {
+                whatsapp.run_inbound(inbound_tx).await;
+            });
+
+            (handle, sender)
+        }
+        other => bail!(
+            "unsupported channel type: {other} (supported: telegram, slack, discord, github, whatsapp)"
+        ),
+    };
 
     // Inbound processor: receives ConnectorEvent, normalizes, writes to /data/inbound/
     let inbound_config = config.clone();

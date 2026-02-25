@@ -14,6 +14,14 @@ pub struct ConnectorConfig {
     pub telegram_bot_token: Option<String>,
     pub slack_bot_token: Option<String>,
     pub slack_app_token: Option<String>,
+    pub discord_bot_token: Option<String>,
+    pub github_token: Option<String>,
+    pub github_webhook_secret: Option<String>,
+    pub github_webhook_port: u16,
+    pub whatsapp_token: Option<String>,
+    pub whatsapp_phone_number_id: Option<String>,
+    pub whatsapp_webhook_verify_token: Option<String>,
+    pub whatsapp_webhook_port: u16,
     pub outbound_poll_interval_ms: u64,
 }
 
@@ -44,6 +52,20 @@ impl ConnectorConfig {
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok(),
             slack_bot_token: env::var("SLACK_BOT_TOKEN").ok(),
             slack_app_token: env::var("SLACK_APP_TOKEN").ok(),
+            discord_bot_token: env::var("DISCORD_BOT_TOKEN").ok(),
+            github_token: env::var("GITHUB_TOKEN").ok(),
+            github_webhook_secret: env::var("GITHUB_WEBHOOK_SECRET").ok(),
+            github_webhook_port: env::var("GITHUB_WEBHOOK_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8084),
+            whatsapp_token: env::var("WHATSAPP_TOKEN").ok(),
+            whatsapp_phone_number_id: env::var("WHATSAPP_PHONE_NUMBER_ID").ok(),
+            whatsapp_webhook_verify_token: env::var("WHATSAPP_WEBHOOK_VERIFY_TOKEN").ok(),
+            whatsapp_webhook_port: env::var("WHATSAPP_WEBHOOK_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8085),
             outbound_poll_interval_ms: env::var("OUTBOUND_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -56,6 +78,9 @@ impl ConnectorConfig {
         match self.channel_type.as_str() {
             "telegram" => ChannelType::Telegram,
             "slack" => ChannelType::Slack,
+            "discord" => ChannelType::Discord,
+            "github" => ChannelType::Github,
+            "whatsapp" => ChannelType::Whatsapp,
             other => panic!("unsupported channel type: {other}"),
         }
     }
@@ -65,6 +90,9 @@ impl ConnectorConfig {
         match self.channel_type.as_str() {
             "telegram" => "tg",
             "slack" => "slack",
+            "discord" => "discord",
+            "github" => "gh",
+            "whatsapp" => "wa",
             _ => "ch",
         }
     }
