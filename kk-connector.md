@@ -3,7 +3,7 @@
 > **Cross-references:**
 > [Communication Protocol](kk-protocol.md) — message formats §4.1, §4.2; nq conventions §2; polling intervals §7
 > [Controller](kk-controller.md) — creates Connector Deployments
-> [Gateway](kubeclaw-plan-gateway.md) — reads inbound queue, writes outbox queue
+> [Gateway](kk-gateway.md) — reads inbound queue, writes outbox queue
 > [Agent Job](kk-agent.md) ·
 > [Skill](kubeclaw-plan-skill.md)
 
@@ -18,9 +18,9 @@ A Connector is a single-replica Deployment created by the Controller (one per Ch
 The Connector runs concurrent tasks:
 1. **Provider dispatcher** — receives events from the provider API, sends `ConnectorEvent` via mpsc channel (messages + new chat events)
 2. **Inbound processor** — receives `ConnectorEvent`, resolves groups (auto-registers unknown chats), normalizes to `InboundMessage`, writes to `/data/inbound/`
-3. **Outbound poller** — polls `/data/outbox/{channel-name}/`, sends responses back via provider API
+3. **Outbound poller** — polls `/data/outbox/{channel-name}/` for final messages and `/data/stream/{channel-name}/` for streaming updates, sends/edits responses back via provider API
 
-The Connector has **no knowledge** of the Gateway, Agent Jobs, Skills, or any other kk internals. It only knows about its provider and the two queue directories.
+The Connector has **no knowledge** of the Gateway, Agent Jobs, Skills, or any other kk internals. It only knows about its provider and the queue directories.
 
 ---
 
@@ -46,6 +46,7 @@ Set by Controller:
 | `CHANNEL_NAME` | Channel CR `metadata.name` | `telegram-bot-1` |
 | `INBOUND_DIR` | Hardcoded by Controller | `/data/inbound` |
 | `OUTBOX_DIR` | Built from CHANNEL_NAME | `/data/outbox/telegram-bot-1` |
+| `STREAM_DIR` | Built from CHANNEL_NAME | `/data/stream/telegram-bot-1` |
 | `GROUPS_D_FILE` | Built from CHANNEL_NAME | `/data/state/groups.d/telegram-bot-1.json` |
 
 Provider credentials come from the Secret via `envFrom`:
@@ -76,9 +77,9 @@ crates/kk-connector/
     ├── outbound.rs          ← outbound poller (nq files → provider API)
     ├── groups.rs            ← GroupMap: chat_id → group slug, auto-registration
     └── provider/
-        ├── mod.rs           ← InboundRaw, ConnectorEvent, ProviderSender enum
-        ├── telegram.rs      ← TelegramProvider (teloxide)
-        └── slack.rs         ← SlackProvider (Socket Mode + Web API)
+        ├── mod.rs           ← InboundRaw, ConnectorEvent, ChatProvider trait
+        ├── telegram.rs      ← TelegramProvider + TelegramOutbound (teloxide)
+        └── slack.rs         ← SlackProvider + SlackOutbound (Socket Mode + Web API + native streaming)
 ```
 
 Shared code in `kk-core`:
@@ -99,7 +100,7 @@ crates/kk-core/src/
 1. Read env vars via ConnectorConfig::from_env()
 2. Validate CHANNEL_TYPE is a supported provider (currently: "telegram", "slack")
 3. Validate provider-specific credentials present
-4. Ensure directories: mkdir -p INBOUND_DIR, OUTBOX_DIR, groups.d parent
+4. Ensure directories: mkdir -p INBOUND_DIR, OUTBOX_DIR, STREAM_DIR, groups.d parent
 5. Initialize provider (e.g. TelegramProvider validates token via get_me())
 6. Load initial GroupMap from groups.d/{channel}.json
 7. Create mpsc channel for ConnectorEvent messages (buffer=256)
@@ -214,17 +215,34 @@ Receives `ConnectorEvent` via mpsc, resolves group (auto-registers if unknown), 
 
 ## Outbound Flow (PVC → Provider)
 
+Two paths are polled each cycle:
+
+**Non-streaming (outbox):**
 ```
 /data/outbox/{channel-name}/,{ts}.{id}.nq
-  │
-  │  Outbound poller (every 1s)
+  │  poll_outbound() — every 1s
   │  1. nq::list_pending() — sorted FIFO
   │  2. Read OutboundMessage (Protocol §4.2)
   │  3. Validate channel matches CHANNEL_NAME
-  │  4. Provider::send() — split long messages per provider limit
+  │  4. sender.send() — split long messages per provider limit
   │  5. nq::delete() on success
   ▼
 Provider API → User sees response
+```
+
+**Streaming (stream dir):**
+```
+/data/stream/{channel-name}/{session-id}
+  │  poll_stream() — every 1s
+  │  Dispatch per session file:
+  │  • No .stream-{sid} state file → sender.send_returning_id() (or stream_start for native)
+  │                                    → create .stream-{sid} with platform msg ID
+  │  • .stream-{sid} exists + meta.final=false → sender.edit() (or stream_append for native)
+  │  • .stream-{sid} exists + meta.final=true  → sender.edit() (or stream_stop for native)
+  │                                               → delete both files
+  │  • No .stream-{sid} + meta.final=true → sender.send() → delete stream file
+  ▼
+Provider API → User sees streaming response (edit-in-place or native animation)
 ```
 
 ### Outbound Thread Routing
@@ -279,6 +297,7 @@ K8s sends SIGTERM, waits `terminationGracePeriodSeconds` (default 30s), then SIG
 | `reqwest` 0.12 | Slack Web API HTTP client |
 | `tokio-tungstenite` 0.26 | Slack Socket Mode WebSocket client |
 | `futures-util` 0.3 | Stream/Sink extensions for WebSocket |
+| `async-trait` 0.1 | `ChatProvider` trait with async methods |
 | `tokio` | Async runtime, mpsc channels, timers |
 | `serde` / `serde_json` | Message serialization |
 | `tracing` | Structured JSON logging |
@@ -288,16 +307,38 @@ K8s sends SIGTERM, waits `terminationGracePeriodSeconds` (default 30s), then SIG
 
 ## Providers
 
-### ProviderSender (`provider/mod.rs`)
+### ChatProvider Trait (`provider/mod.rs`)
 
-Enum dispatching outbound sends to the correct provider:
+The core abstraction for outbound messaging. Any provider implementing `send()` + `edit()` gets fallback (edit-in-place) streaming for free. Providers with native streaming override the `stream_*` methods.
 
 ```rust
-pub enum ProviderSender {
-    Telegram(teloxide::Bot),
-    Slack(SlackSender),
+#[async_trait]
+pub trait ChatProvider: Send + Sync {
+    async fn send(&self, msg: &OutboundMessage) -> Result<()>;
+    async fn send_returning_id(&self, msg: &OutboundMessage) -> Result<String>;
+    async fn edit(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()>;
+
+    // Optional native streaming (default: false / bail)
+    fn supports_native_stream(&self) -> bool { false }
+    async fn stream_start(&self, msg: &OutboundMessage) -> Result<String> { ... }
+    async fn stream_append(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> { ... }
+    async fn stream_stop(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> { ... }
 }
 ```
+
+Each platform has a `*Provider` (lifecycle/bootstrap + inbound) and `*Outbound` (implements `ChatProvider`):
+
+```
+TelegramProvider::new(token)
+    ├── .sender()        → TelegramOutbound (implements ChatProvider)
+    └── .run_inbound()   → consumes self, runs teloxide dispatcher
+
+SlackProvider::new(bot_token, app_token)
+    ├── .sender()        → SlackOutbound (implements ChatProvider + native streaming)
+    └── .run_inbound()   → consumes self, runs Socket Mode
+```
+
+The outbound loop uses `&dyn ChatProvider` for open extension — adding a new provider requires only `impl ChatProvider for MyOutbound`, no match arms to update.
 
 ### Telegram (`provider/telegram.rs`)
 
@@ -342,7 +383,8 @@ Uses **Socket Mode** (WebSocket) for inbound — no HTTP server needed, connecti
 {
     "channel_id": "C0123456789",
     "message_ts": "1234567890.123456",
-    "user_id": "U0123456789"
+    "user_id": "U0123456789",
+    "team_id": "T0123456789"
 }
 ```
 

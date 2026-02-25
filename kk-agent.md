@@ -374,6 +374,26 @@ When `THREAD_ID` is set, the agent polls the thread-specific queue:
 
 This is handled by `DataPaths::group_queue_dir_threaded(group, thread_id.as_deref())`.
 
+### Context Overflow Detection
+
+After each Claude invocation (Phase 1 and each Phase 2 follow-up), the Agent checks for context overflow by scanning both `response.jsonl` and `agent.log` for patterns:
+- `context_length_exceeded`
+- `context window`
+- `maximum context length`
+- `token limit`
+- `too many tokens`
+
+If overflow is detected, the Agent writes `status=overflow` and exits immediately. The Gateway's results loop picks this up via `process_overflow`, which sends the last response text with an overflow notice.
+
+### Stop Sentinel
+
+At the start of each Phase 2 poll iteration, the Agent checks for a stop sentinel file at `/data/groups/{group}/_stop` (or `/data/groups/{group}/threads/{tid}/_stop` for threaded). This file is written by the Gateway when a user sends `/stop`.
+
+When detected:
+1. Delete the sentinel file
+2. Write `status=stopped`
+3. Return immediately (skip remaining follow-ups)
+
 ### Idle Timeout Behavior
 
 ```
@@ -422,7 +442,9 @@ If multiple follow-up messages are pending when the Agent polls, they are all pr
 
 Implementation: `std::fs::write(status_path, ResultStatus::Done.as_str())`.
 
-The Gateway's results loop polls this file. On seeing "done", it reads `response.jsonl` and `request.json` to route the response.
+Note: The status file may already contain `stopped` or `overflow` if the Agent exited early from Phase 2 due to a stop sentinel or context overflow. In those cases, Phase 3 is not reached — the Agent returns directly.
+
+The Gateway's results loop polls this file. On seeing `done`/`stopped`/`overflow`/`error`, it reads `response.jsonl` and `request.json` to route the response.
 
 ### What the Agent does NOT clean up
 
@@ -473,7 +495,7 @@ After a complete Job run, the results directory looks like:
 │                                Protocol §4.4 — routing info
 │
 ├── status                    ← Written by Agent
-│                                "running" → "done" (or "error")
+│                                "running" → "done" / "error" / "stopped" / "overflow"
 │                                Protocol §4.5
 │
 ├── response.jsonl            ← Written by Agent (streaming, appended)
@@ -517,14 +539,16 @@ The session directory `/data/sessions/{group}/` persists across Job runs for the
 | Skill symlinks | `.claude/skills/`, `.agents/skills/` | Refreshed each Job (Phase 0 overwrites) |
 | Files created by Claude | Any files claude creates in cwd | Available to future Jobs for the same group |
 
-### What does NOT persist across Jobs
+### Cross-Job Session Resume
 
-| What | Why |
-|---|---|
-| Claude conversation history | Each Job starts a new `claude -p` session. `--resume` only works within the same Job's Phase 2. |
-| In-memory state | Pod is gone. No process state carries over. |
+The Agent persists the Claude session ID to a file after each invocation. On the next Job for the same group, Phase 1 reads this file and passes the session ID to `claude --resume {session-id}`, allowing Claude Code to continue the conversation from the previous Job.
 
-If cross-Job conversation memory is needed in the future, it would go in `/data/memory/{group}/CLAUDE.md` (human-curated) or a future conversation log mechanism.
+| What | Where | Effect |
+|---|---|---|
+| Claude session ID file | `/data/sessions/{group}/.claude-session-id` | `--resume {id}` loads previous conversation across Jobs |
+| In-memory state | Pod is gone | No process state carries over — only the Claude session persists |
+
+If the session ID file is missing or empty (first Job for a group), Phase 1 starts a fresh session.
 
 ---
 
@@ -634,7 +658,7 @@ Example log output:
 
 ## Tests
 
-The agent has 27 tests (8 unit + 19 integration), all passing.
+The agent has 33 tests (15 unit + 18 integration), all passing.
 
 Tests use a **mock claude binary** — a bash script that writes predictable JSONL to stdout and exits with a configurable code. The `CLAUDE_BIN` config field points to the mock.
 
@@ -648,6 +672,13 @@ Tests use a **mock claude binary** — a bash script that writes predictable JSO
 | `build_prompt_no_context` | Prompt only, no separators |
 | `build_prompt_empty_contexts_ignored` | Empty strings treated as missing |
 | `truncate_short` / `truncate_exact` / `truncate_long` | UTF-8-safe string truncation |
+| `extract_session_id_from_result_line` | Extracts Claude session ID from response.jsonl result line |
+| `extract_session_id_missing` | No session_id field → None |
+| `extract_session_id_empty_file` | Empty file → None |
+| `extract_session_id_no_file` | Non-existent file → None |
+| `detect_overflow_in_response` | `context_length_exceeded` in response.jsonl → true |
+| `detect_overflow_in_log` | `maximum context length` in agent.log → true |
+| `no_overflow_normal_response` | Normal response without overflow patterns → false |
 
 ### Integration tests (`e2e_agent.rs`)
 
@@ -681,12 +712,6 @@ Tests use a **mock claude binary** — a bash script that writes predictable JSO
 | `phase2_invalid_json_skipped` | Invalid JSON → skipped, file deleted, claude NOT called |
 | `phase2_idle_timeout` | No messages → exits after idle timeout |
 | `phase2_threaded_queue` | With thread_id=42 → polls thread-specific queue, non-threaded queue unaffected |
-
-**Phase 3 — Done:**
-
-| Test | Verifies |
-|---|---|
-| `phase3_status_done` | Status file written as "done" |
 
 **E2E — Full Lifecycle:**
 

@@ -1,11 +1,11 @@
-# KubeClaw: Plan — Skill
+# kk: Skill
 
 > **Cross-references:**
-> [Communication Protocol](protocol.md) — file paths §5.2, §5.3; ownership §3
-> [Plan: Controller](plan-controller.md) — reconciles Skill CRs, clones repos, writes to PVC
-> [Plan: Agent Job](plan-agent-job.md) — Phase 0 symlinks skills into session directory
-> [Plan: Connector](plan-connector.md) ·
-> [Plan: Gateway](plan-gateway.md)
+> [Communication Protocol](kk-protocol.md) — file paths §5.2, §5.3; ownership §3
+> [Controller](kk-controller.md) — reconciles Skill CRs, clones repos, writes to PVC
+> [Agent Job](kk-agent.md) — Phase 0 symlinks skills into session directory
+> [Connector](kk-connector.md) ·
+> [Gateway](kk-gateway.md)
 
 ---
 
@@ -121,9 +121,9 @@ description: "A useful skill for documents."
 apiVersion: apiextensions.k8s.io/v1
 kind: CustomResourceDefinition
 metadata:
-  name: skills.kubeclaw.io
+  name: skills.kk.io
 spec:
-  group: kubeclaw.io
+  group: kk.io
   versions:
   - name: v1alpha1
     served: true
@@ -267,7 +267,7 @@ After installing three skills:
 
 ### Permissions
 
-Set by Controller after copying (see [Controller Plan](plan-controller.md) — Skill Reconciliation §7–8):
+Set by Controller after copying (see [Controller](kk-controller.md) — Skill Reconciliation):
 
 | Path | Permission | Why |
 |---|---|---|
@@ -356,7 +356,7 @@ User                    Controller              PVC
 There is no in-place update mechanism. The user deletes and recreates the CR:
 
 ```bash
-kubectl delete skill frontend-design -n kubeclaw
+kubectl delete skill frontend-design -n kk
 kubectl apply -f skill-frontend-design.yaml
 ```
 
@@ -424,7 +424,7 @@ If a SKILL.md references scripts:
    ```
 ```
 
-In KubeClaw, the script path would be:
+In kk, the script path would be:
 ```
 /data/skills/vercel-deploy/scripts/deploy.sh
 ```
@@ -457,11 +457,11 @@ Claude reads `references/api-reference.md` only when it needs the detailed refer
 ```bash
 # Single skill
 cat <<EOF | kubectl apply -f -
-apiVersion: kubeclaw.io/v1alpha1
+apiVersion: kk.io/v1alpha1
 kind: Skill
 metadata:
   name: frontend-design
-  namespace: kubeclaw
+  namespace: kk
 spec:
   source: vercel-labs/agent-skills/skills/frontend-design
 EOF
@@ -473,7 +473,7 @@ kubectl apply -f skills.yaml
 ### List Installed Skills
 
 ```bash
-kubectl get skills -n kubeclaw
+kubectl get skills -n kk
 
 # NAME               SOURCE                                              SKILL              STATUS   AGE
 # frontend-design    vercel-labs/agent-skills/skills/frontend-design      frontend-design    Ready    5d
@@ -484,10 +484,10 @@ kubectl get skills -n kubeclaw
 ### Inspect a Skill
 
 ```bash
-kubectl describe skill frontend-design -n kubeclaw
+kubectl describe skill frontend-design -n kk
 
 # Name:         frontend-design
-# Namespace:    kubeclaw
+# Namespace:    kk
 # Spec:
 #   Source:  vercel-labs/agent-skills/skills/frontend-design
 # Status:
@@ -501,30 +501,30 @@ kubectl describe skill frontend-design -n kubeclaw
 
 ```bash
 # Check what's on the PVC
-kubectl exec -n kubeclaw deploy/kubeclaw-gateway -- ls /data/skills/
+kubectl exec -n kk deploy/kk-gateway -- ls /data/skills/
 # frontend-design
 # vercel-deploy
 # agent-browser
 
 # Read the SKILL.md
-kubectl exec -n kubeclaw deploy/kubeclaw-gateway -- cat /data/skills/frontend-design/SKILL.md
+kubectl exec -n kk deploy/kk-gateway -- cat /data/skills/frontend-design/SKILL.md
 
 # Check if scripts are executable
-kubectl exec -n kubeclaw deploy/kubeclaw-gateway -- ls -la /data/skills/vercel-deploy/scripts/
+kubectl exec -n kk deploy/kk-gateway -- ls -la /data/skills/vercel-deploy/scripts/
 # -rwxr-xr-x  1 root root  2048 Feb 20 10:30 deploy.sh
 ```
 
 ### Update a Skill
 
 ```bash
-kubectl delete skill frontend-design -n kubeclaw
+kubectl delete skill frontend-design -n kk
 kubectl apply -f skill-frontend-design.yaml
 ```
 
 ### Remove a Skill
 
 ```bash
-kubectl delete skill agent-browser -n kubeclaw
+kubectl delete skill agent-browser -n kk
 # Controller removes /data/skills/agent-browser/
 # Next Agent Job won't symlink it
 # Running Agent Jobs: dangling symlink, agent ignores
@@ -533,7 +533,7 @@ kubectl delete skill agent-browser -n kubeclaw
 ### Remove All Skills
 
 ```bash
-kubectl delete skills --all -n kubeclaw
+kubectl delete skills --all -n kk
 ```
 
 ---
@@ -674,7 +674,7 @@ Skills can include scripts that the LLM agent may execute. This is inherent to t
 - Agent Jobs run with resource limits (CPU, memory, deadline)
 - Agent Jobs have no K8s API access (no ServiceAccount privileges)
 - Agent Jobs only mount the shared PVC — no host filesystem access
-- The PVC is scoped to the kubeclaw namespace
+- The PVC is scoped to the kk namespace
 - Review skills before installing (same as any code you run)
 
 ### Untrusted Skill Sources

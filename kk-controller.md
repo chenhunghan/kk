@@ -3,7 +3,7 @@
 > **Cross-references:**
 > [Communication Protocol](kk-protocol.md) ·
 > [Connector](kk-connector.md) ·
-> [Gateway](kubeclaw-plan-gateway.md) ·
+> [Gateway](kk-gateway.md) ·
 > [Agent Job](kk-agent.md) ·
 > [Skill](kubeclaw-plan-skill.md)
 
@@ -236,6 +236,8 @@ Required fields: `name` (non-empty), `description` (non-empty). Parsed via `serd
 |---|---|---|
 | Channel | Requeue after 300s (periodic re-check) | Requeue after 30s (via error_policy) |
 | Skill | `await_change()` (no periodic requeue) | Requeue after 60s (via error_policy) |
+
+**Note on Skill parse errors:** When `parse_source()` fails (invalid source format), the reconciler returns `Ok(Action::requeue(300))` directly — bypassing `error_policy`. This gives users more time to fix the CR spec. All other errors propagate to `error_policy` for the standard 60s requeue.
 
 ---
 

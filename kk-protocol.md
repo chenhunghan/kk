@@ -95,14 +95,17 @@ No separate done marker. Successful processing = file deleted. If a file persist
 /data/
 ├── inbound/                    WRITE: Connectors    READ: Gateway
 ├── groups/{group}/        WRITE: Gateway       READ: Agent Jobs
-│   └── threads/{thread-id}/    WRITE: Gateway       READ: Agent Jobs (threaded)
+│   ├── threads/{thread-id}/    WRITE: Gateway       READ: Agent Jobs (threaded)
+│   └── _stop                   WRITE: Gateway       READ: Agent Jobs (stop sentinel)
 ├── outbox/{channel-name}/      WRITE: Gateway       READ: Connectors
+├── stream/{channel-name}/      WRITE: Gateway       READ: Connectors (streaming)
 ├── results/{session-id}/       WRITE: Agent Jobs    READ: Gateway
 ├── skills/{skill-name}/        WRITE: Controller    READ: Agent Jobs
 ├── sessions/{group}/      R+W:   Agent Jobs    (claude state)
 │   └── threads/{thread-id}/    R+W:   Agent Jobs    (threaded sessions)
 ├── memory/                     R+W:   Human/Admin   READ: Agent Jobs
 └── state/
+    ├── groups.json             WRITE: Human/Admin   READ: Gateway (admin overrides)
     ├── groups.d/               WRITE: Connectors    READ: Gateway
     └── cursors.json            R+W:   Gateway
 ```
@@ -114,10 +117,12 @@ No separate done marker. Successful processing = file deleted. If a file persist
 | `/data/inbound/` | Connectors | Gateway | Gateway (deletes after processing) |
 | `/data/groups/{group}/` | Gateway | Agent Job for that group | Agent Job (deletes after processing) |
 | `/data/outbox/{channel}/` | Gateway | Connector for that channel | Connector (deletes after sending) |
+| `/data/stream/{channel}/` | Gateway | Connector for that channel | Connector (deletes after final edit) |
 | `/data/results/{session}/` | Agent Job | Gateway | Gateway (moves to `.done/` after reading) |
 | `/data/skills/{skill}/` | Controller | Agent Jobs (via symlink) | Controller (on Skill CR delete) |
 | `/data/sessions/{group}/` | Agent Jobs | Agent Jobs | Never auto-cleaned (persistent state) |
 | `/data/memory/` | Human (kubectl/editor) | Agent Jobs | Never auto-cleaned |
+| `/data/state/groups.json` | Human (kubectl/editor) | Gateway | Admin overrides (takes precedence over groups.d) |
 | `/data/state/groups.d/` | Connectors (own file) | Gateway | Connectors (overwrite on register) |
 | `/data/state/cursors.json` | Gateway | Gateway | Gateway (overwrites in place) |
 
@@ -251,9 +256,19 @@ Plain text file, single line, one of:
 running
 done
 error
+stopped
+overflow
 ```
 
-No JSON. Just the string. Gateway reads with `cat` / `readFile` and trims whitespace.
+| Status | Meaning |
+|---|---|
+| `running` | Job is still executing |
+| `done` | Job completed successfully |
+| `error` | Job failed (auth failure, config error, etc.) |
+| `stopped` | Job was stopped by user via `/stop` command |
+| `overflow` | Job hit context window limit — session ID is cleared for fresh restart |
+
+No JSON. Just the string. Gateway reads with `readFile` and trims whitespace.
 
 ### 4.6 Result Response File
 
@@ -408,6 +423,7 @@ Connectors auto-register unknown chats by writing to their `groups.d/{channel-na
 | **Gateway** — results loop | Result status files | `/data/results/*/status` | **2 seconds** | Checks for completed Jobs |
 | **Gateway** — cleanup loop | Completed K8s Jobs | K8s API (batch/v1 Jobs) | **60 seconds** | Deletes Jobs older than 5min |
 | **Connector** — outbound loop | Outbound queue | `/data/outbox/{channel}/` | **1 second** | Faster for responsiveness |
+| **Connector** — stream loop | Stream files | `/data/stream/{channel}/` | **1 second** | Polled alongside outbox in same loop |
 | **Agent Job** — follow-up loop | Per-group queue | `/data/groups/{group}/` | **2 seconds** | Phase 2 hot-path polling |
 | **Agent Job** — idle timeout | No new messages | Per-group queue | **120 seconds** (default) | Configurable via `IDLE_TIMEOUT` env |
 | **Controller** | K8s informer | Channel + Skill CRDs | **event-driven** | Not polling — uses K8s watch |
@@ -537,8 +553,23 @@ The only potential race is if Gateway creates a Job at the exact moment a previo
 1. Gateway creates:          /data/results/{session-id}/request.json
 2. Agent writes:             /data/results/{session-id}/status  → "running"
 3. Agent writes:             /data/results/{session-id}/response.jsonl  (streaming)
-4. Agent writes:             /data/results/{session-id}/status  → "done" (or "error")
+3a. Gateway reads:           response.jsonl incrementally → writes /data/stream/{channel}/{session-id}
+                             (intermediate streaming to Connector for edit-in-place or native streaming)
+4. Agent writes:             /data/results/{session-id}/status  → "done" | "error" | "stopped" | "overflow"
 5. Gateway reads:            status, response.jsonl, request.json
+5a. Gateway writes:          final text to /data/stream/{channel}/{session-id} (meta.final=true)
+                             OR to /data/outbox/{channel}/ if no streaming was active
 6. Gateway moves:            /data/results/{session-id}/ → /data/results/.done/{session-id}/
 7. Gateway cleanup (daily):  rm -rf /data/results/.done/* older than 24h
 ```
+
+### Stop Sentinel
+
+The Gateway writes a stop sentinel file when a user sends `/stop` or `stop`:
+
+```
+/data/groups/{group}/_stop                    (non-threaded)
+/data/groups/{group}/threads/{thread-id}/_stop (threaded)
+```
+
+The Agent polls for this file in Phase 2. When detected, the Agent deletes the sentinel, writes `status=stopped`, and exits.

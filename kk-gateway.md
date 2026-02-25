@@ -1,13 +1,13 @@
 # kk-gateway
 
 > **Crate:** `crates/kk-gateway` — Rust, async (tokio)
-> **Cross-references:** [Protocol](kubeclaw-protocol.md) · [Controller](kk-controller.md) · [Connector](kk-connector.md) · [Agent Job](kk-agent.md) · [Skill](kubeclaw-plan-skill.md)
+> **Cross-references:** [Protocol](kk-protocol.md) · [Controller](kk-controller.md) · [Connector](kk-connector.md) · [Agent Job](kk-agent.md) · [Skill](kubeclaw-plan-skill.md)
 
 ---
 
 ## Summary
 
-The Gateway is a single-replica Deployment and the **routing brain** of kk. It reads messages from the inbound queue, decides whether to act, creates Agent Jobs (cold path) or forwards to running Jobs (hot path), reads completed results, and writes responses to the outbox.
+The Gateway is a single-replica Deployment and the **routing brain** of kk. It reads messages from the inbound queue, decides whether to act, creates Agent Jobs (cold path) or forwards to running Jobs (hot path), reads completed results, writes streaming updates to the stream directory, and writes final responses to the outbox.
 
 All inter-component communication is via files on a shared RWX PVC — no network calls between components.
 
@@ -46,7 +46,7 @@ crates/kk-gateway/
 | Loop | Module | Polls | Default Interval | Purpose |
 |---|---|---|---|---|
 | **Inbound** | `loops::inbound` | `/data/inbound/` | 2s | Route messages: create Jobs (cold) or enqueue follow-ups (hot) |
-| **Results** | `loops::results` | `/data/results/*/status` | 2s | Read completed results, write to outbox, archive |
+| **Results** | `loops::results` | `/data/results/*/status` | 2s | Read completed results, stream partials, write final to outbox, archive |
 | **Cleanup** | `loops::cleanup` | K8s Jobs API + filesystem | 60s | Delete finished Jobs, detect crashed Jobs, clean orphaned queues, purge archives |
 | **State reload** | `loops::state_reload` | `/data/state/groups*.json` | 30s | Reload groups config from disk |
 
@@ -159,12 +159,23 @@ pub struct ActiveJob {
 ### `route_message`
 
 1. Look up `msg.group` in `groups_config` → skip if unregistered
-2. Check trigger:
+2. **Stop command check**: if `is_stop_command(msg.text)` → `handle_stop` (write stop sentinel, remove from active_jobs)
+3. Check trigger:
    - `Always` → always trigger
    - `Mention` → `msg.text.contains(trigger_pattern)`
    - `Prefix` → `msg.text.starts_with(trigger_pattern)`
-3. Build routing key: `routing_key(group, thread_id)`
-4. If key in `active_jobs` → **hot path**, else → **cold path**
+4. Build routing key: `routing_key(group, thread_id)`
+5. If key in `active_jobs` → **hot path**, else → **cold path**
+
+### Stop Command
+
+`is_stop_command(text)` matches `/stop` or `stop` (case-insensitive, trimmed). When a stop command is detected:
+
+1. Look up active Job by routing key — if none, ignore
+2. Write stop sentinel file to `/data/groups/{group}/_stop` (or `/data/groups/{group}/threads/{tid}/_stop` for threaded)
+3. Remove from `active_jobs`
+
+The Agent detects this sentinel file in Phase 2 and exits early with `status=stopped`.
 
 ### Cold Path (`cold_path`)
 
@@ -219,16 +230,18 @@ Produces a `batch/v1 Job` with:
 2. Skip `.done/` and non-directories
 3. Read `status` file for each session dir
 4. Dispatch on status:
-   - `running` → skip
+   - `running` → `try_stream_partial` (tail response.jsonl for intermediate streaming updates)
    - `done` → `process_done`
    - `error` → `process_error`
+   - `stopped` → `process_stopped`
+   - `overflow` → `process_overflow`
    - unknown → warn and skip
 
 ### `process_done`
 
 1. `read_manifest` — parse `request.json` for routing info
 2. `extract_response_text` — parse `response.jsonl`
-3. `write_outbound` — build and enqueue `OutboundMessage` to `/data/outbox/{channel}/`
+3. `write_final_or_outbox` — if a stream file exists, overwrite it with `meta.final: true` (Connector does final edit + cleanup); otherwise fall back to `write_outbound` to enqueue to `/data/outbox/{channel}/`
 4. `archive_results` — move session dir to `/data/results/.done/`
 5. `remove_from_active` — remove routing key from `active_jobs`
 
@@ -236,9 +249,36 @@ Produces a `batch/v1 Job` with:
 
 1. `read_manifest`
 2. Build error text: `"[kk] Agent job failed for session {session_id}. Check logs for details."`
-3. `write_outbound`
+3. `write_final_or_outbox`
 4. `archive_results`
 5. `remove_from_active`
+
+### `process_stopped`
+
+1. `read_manifest`
+2. Build stopped text: `"[kk] Session stopped by user."`
+3. `write_final_or_outbox`
+4. `archive_results`
+5. `remove_from_active`
+
+### `process_overflow`
+
+1. `read_manifest`
+2. `extract_response_text` — get last response before overflow
+3. Build overflow text with the last response + overflow notice
+4. `write_final_or_outbox`
+5. `archive_results`
+6. `remove_from_active`
+
+### `try_stream_partial`
+
+Called for sessions with `status=running`. Tails `response.jsonl` incrementally, extracts the latest assistant text, and writes it to the stream file at `/data/stream/{channel}/{session-id}` (atomic write via tmp+rename) with `meta.final: false`. The Connector polls this file and sends/edits the platform message.
+
+### `write_final_or_outbox`
+
+Shared helper used by `process_done`, `process_error`, `process_stopped`, and `process_overflow`:
+- If a stream file exists for this session → overwrite it with the final text and `meta.final: true` (Connector does the final edit and cleans up)
+- If no stream file exists → fall back to `write_outbound` (enqueue to outbox as a regular message)
 
 ### `extract_response_text`
 
@@ -289,14 +329,14 @@ Port 8082 (via `kk_core::health::HealthServer`):
 
 ## Testing
 
-### Unit Tests (12)
+### Unit Tests (13)
 
 In `#[cfg(test)]` modules within source files:
 
 | Module | Tests | What they cover |
 |---|---|---|
 | `state` | 3 | `routing_key`, `load_groups_config` (empty, merge with admin override) |
-| `loops::inbound` | 5 | `strip_trigger` (prefix, mention, always), `build_agent_job` (threaded, unthreaded) |
+| `loops::inbound` | 6 | `strip_trigger` (prefix, mention, always), `build_agent_job` (threaded, unthreaded), `is_stop_command` |
 | `loops::results` | 4 | `extract_response_text` (result line, assistant fallback, no file, empty file) |
 
 ### E2E Tests (23)
@@ -359,7 +399,7 @@ In `tests/e2e_gateway.rs`, using `GatewayTestHarness` from `tests/common/mod.rs`
 ### Running Tests
 
 ```bash
-cargo test -p kk-gateway                       # all 35 tests (12 unit + 23 e2e)
+cargo test -p kk-gateway                       # all 36 tests (13 unit + 23 e2e)
 cargo test -p kk-gateway --test e2e_gateway     # e2e only
 cargo clippy -p kk-gateway                      # lint
 cargo test --workspace                           # no regressions
