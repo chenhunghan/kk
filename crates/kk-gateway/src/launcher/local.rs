@@ -5,8 +5,10 @@ use std::sync::Arc;
 
 use anyhow::{Context, Result};
 use async_trait::async_trait;
+use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::process::Command;
 use tokio::sync::RwLock;
+use tokio::sync::mpsc::UnboundedSender;
 use tracing::info;
 
 use crate::config::GatewayConfig;
@@ -28,14 +30,18 @@ pub struct LocalLauncher {
     agent_bin: String,
     data_dir: String,
     children: Arc<RwLock<HashMap<String, LocalChild>>>,
+    /// When set, kk-agent stdout/stderr lines are forwarded here instead of
+    /// inheriting the parent's terminal (used by the TUI log panel).
+    log_tx: Option<UnboundedSender<String>>,
 }
 
 impl LocalLauncher {
-    pub fn new(agent_bin: &str, data_dir: &str) -> Self {
+    pub fn new(agent_bin: &str, data_dir: &str, log_tx: Option<UnboundedSender<String>>) -> Self {
         Self {
             agent_bin: agent_bin.to_string(),
             data_dir: data_dir.to_string(),
             children: Arc::new(RwLock::new(HashMap::new())),
+            log_tx,
         }
     }
 }
@@ -61,9 +67,41 @@ impl Launcher for LocalLauncher {
             cmd.env("THREAD_ID", tid);
         }
 
-        let child = cmd
+        // When a log channel is provided (TUI mode), pipe kk-agent's stdio and
+        // forward each line to the channel so the log panel can display it.
+        // Without a channel, inherit stdio so logs appear on the terminal as-is.
+        if self.log_tx.is_some() {
+            cmd.stdout(std::process::Stdio::piped())
+                .stderr(std::process::Stdio::piped())
+                .env("LOG_FORMAT", "json");
+        }
+
+        let mut child = cmd
             .spawn()
             .with_context(|| format!("spawn agent binary: {}", self.agent_bin))?;
+
+        if let Some(ref tx) = self.log_tx {
+            // Forward stdout lines
+            if let Some(stdout) = child.stdout.take() {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stdout).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = tx.send(line);
+                    }
+                });
+            }
+            // Forward stderr lines
+            if let Some(stderr) = child.stderr.take() {
+                let tx = tx.clone();
+                tokio::spawn(async move {
+                    let mut lines = BufReader::new(stderr).lines();
+                    while let Ok(Some(line)) = lines.next_line().await {
+                        let _ = tx.send(line);
+                    }
+                });
+            }
+        }
 
         let now = now_secs();
         let handle_name = job_name.to_string();

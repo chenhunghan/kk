@@ -24,7 +24,7 @@ async fn main() -> Result<()> {
         "local" => {
             let agent_bin = std::env::var("AGENT_BIN").unwrap_or_else(|_| "kk-agent".into());
             info!(agent_bin, "using local process launcher");
-            Arc::new(LocalLauncher::new(&agent_bin, &config.data_dir))
+            Arc::new(LocalLauncher::new(&agent_bin, &config.data_dir, None))
         }
         _ => {
             #[cfg(feature = "k8s")]

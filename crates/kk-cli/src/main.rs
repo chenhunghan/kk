@@ -1,8 +1,11 @@
+use std::io;
 use std::sync::Arc;
 
 use anyhow::Result;
 use tokio::process::Command;
+use tokio::sync::mpsc;
 use tracing::{error, info, warn};
+use tracing_subscriber::EnvFilter;
 
 mod config;
 mod terminal;
@@ -15,9 +18,54 @@ use kk_gateway::launcher::local::LocalLauncher;
 use kk_gateway::loops;
 use kk_gateway::state::SharedState;
 
+// ---------------------------------------------------------------------------
+// Custom tracing writer that sends log lines to the TUI log panel channel.
+// ---------------------------------------------------------------------------
+
+struct ChannelWriter(mpsc::UnboundedSender<String>);
+
+impl io::Write for ChannelWriter {
+    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
+        if let Ok(s) = std::str::from_utf8(buf) {
+            let s = s.trim_end_matches('\n');
+            if !s.is_empty() {
+                let _ = self.0.send(s.to_string());
+            }
+        }
+        Ok(buf.len())
+    }
+    fn flush(&mut self) -> io::Result<()> {
+        Ok(())
+    }
+}
+
+#[derive(Clone)]
+struct ChannelMakeWriter(mpsc::UnboundedSender<String>);
+
+impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ChannelMakeWriter {
+    type Writer = ChannelWriter;
+    fn make_writer(&'a self) -> Self::Writer {
+        ChannelWriter(self.0.clone())
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Main
+// ---------------------------------------------------------------------------
+
 #[tokio::main]
 async fn main() -> Result<()> {
-    kk_core::logging::init();
+    // Create the log channel before initialising tracing so that all log
+    // events (including startup) are captured by the TUI panel.
+    let (log_tx, log_rx) = mpsc::unbounded_channel::<String>();
+
+    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
+    tracing_subscriber::fmt()
+        .with_env_filter(filter)
+        .with_target(true)
+        .with_ansi(false) // no ANSI escape codes — ratatui handles styling
+        .with_writer(ChannelMakeWriter(log_tx.clone()))
+        .init();
 
     let mut kk_config = KkConfig::load()?;
 
@@ -65,10 +113,11 @@ async fn main() -> Result<()> {
     // 2. Build GatewayConfig from kk.yaml values
     let gw_config = build_gateway_config(&kk_config);
 
-    // 3. Create local launcher
+    // 3. Create local launcher — forward kk-agent logs to the TUI panel
     let launcher: Arc<dyn Launcher> = Arc::new(LocalLauncher::new(
         &kk_config.agent_bin,
         &kk_config.data_dir,
+        Some(log_tx),
     ));
 
     // 4. Build shared state
@@ -109,10 +158,8 @@ async fn main() -> Result<()> {
         paths.clone(),
     ));
 
-    // 9. Run terminal connector in-process
-    let terminal = tokio::spawn(terminal::run(paths));
-
-    info!("kk is running — type a message or press Ctrl+C to stop");
+    // 9. Run TUI terminal connector in-process
+    let terminal = tokio::spawn(terminal::run(paths, log_rx));
 
     // 10. Wait for shutdown or crash
     tokio::select! {
@@ -191,7 +238,6 @@ async fn watch_connectors(
                         status = %status,
                         "connector exited, restarting"
                     );
-                    // Find the channel config and restart
                     if let Some(ch_config) = config.channels.iter().find(|c| c.name == *name) {
                         match spawn_connector(&config, ch_config, &paths) {
                             Ok(new_child) => {
@@ -204,7 +250,7 @@ async fn watch_connectors(
                         }
                     }
                 }
-                Ok(None) => {} // Still running
+                Ok(None) => {}
                 Err(e) => {
                     warn!(channel = name.as_str(), error = %e, "error checking connector status");
                 }
