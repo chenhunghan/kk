@@ -442,4 +442,36 @@ mod tests {
         let text = extract_response_text(&path).unwrap();
         assert_eq!(text, "(no response)");
     }
+
+    // Codex produces {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
+    // ResultLine parses ANY {"type":...} object due to serde defaults, so the old
+    // unconditional `continue` after the Claude block silently discarded all Codex lines.
+    #[test]
+    fn test_extract_text_codex_agent_message() {
+        let lines = concat!(
+            r#"{"type":"thread.started","thread_id":"abc-123"}"#,
+            "\n",
+            r#"{"type":"turn.started"}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_0","type":"reasoning","text":"thinking..."}}"#,
+            "\n",
+            r#"{"type":"item.completed","item":{"id":"item_1","type":"agent_message","text":"Hi there!"}}"#,
+            "\n",
+            r#"{"type":"turn.completed","usage":{"input_tokens":100,"output_tokens":5}}"#,
+            "\n",
+        );
+        assert_eq!(
+            extract_text_from_lines(lines),
+            Some("Hi there!".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_text_codex_not_shadowed_by_result_line_parse() {
+        // Specifically guards against the regression where item.completed was parsed
+        // as ResultLine (succeeds due to serde defaults) and then `continue` skipped
+        // the codex-specific check, returning None instead of the agent message.
+        let line = r#"{"type":"item.completed","item":{"type":"agent_message","text":"Hello"}}"#;
+        assert_eq!(extract_text_from_lines(line), Some("Hello".to_string()));
+    }
 }
