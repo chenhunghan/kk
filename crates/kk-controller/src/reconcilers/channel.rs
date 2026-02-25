@@ -267,7 +267,7 @@ fn determine_deployment_phase(deploy: &Deployment) -> (String, String, String) {
     )
 }
 
-async fn reconcile(channel: Arc<Channel>, ctx: Arc<Ctx>) -> Result<Action, Error> {
+pub async fn reconcile(channel: Arc<Channel>, ctx: Arc<Ctx>) -> Result<Action, Error> {
     let name = channel.metadata.name.as_deref().unwrap_or("unknown");
     let ns = channel.metadata.namespace.as_deref().unwrap_or("default");
     info!(channel = name, namespace = ns, "reconciling channel");

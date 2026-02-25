@@ -332,7 +332,7 @@ async fn cleanup_skill(skill: Arc<Skill>, ctx: &Ctx) -> Result<Action, Error> {
     Ok(Action::await_change())
 }
 
-async fn reconcile(skill: Arc<Skill>, ctx: Arc<Ctx>) -> Result<Action, Error> {
+pub async fn reconcile(skill: Arc<Skill>, ctx: Arc<Ctx>) -> Result<Action, Error> {
     let ns = skill.metadata.namespace.as_deref().unwrap_or("default");
     let skills: Api<Skill> = Api::namespaced(ctx.client.clone(), ns);
 

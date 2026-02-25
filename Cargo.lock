@@ -1314,8 +1314,11 @@ name = "kk-controller"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "bytes",
  "chrono",
  "futures",
+ "http 1.4.0",
+ "http-body-util",
  "k8s-openapi",
  "kk-core",
  "kube",
@@ -1323,8 +1326,10 @@ dependencies = [
  "serde",
  "serde_json",
  "serde_yaml",
+ "tempfile",
  "thiserror 2.0.18",
  "tokio",
+ "tower",
  "tracing",
  "tracing-subscriber",
 ]
