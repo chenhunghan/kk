@@ -307,7 +307,22 @@ On each message:
 
 **Within a single Job (hot path):** `--resume` flag on `claude` CLI, working directory persists.
 
-**Across Jobs (cold path):** Session directory `/data/sessions/{group}/` persists on PVC. `.claude/` state survives. However, `--resume` does **not** work across separate Jobs — each new Job starts a fresh conversation. Cross-Job memory relies on curated `SOUL.md` and per-group `CLAUDE.md` files.
+**Across Jobs (cold path):** Session ID captured from Claude's `stream-json` output and persisted to `/data/sessions/{group}/claude_session_id` on the shared PVC. On next Job startup, Phase 1 reads this file and passes `--resume <session_id>` to the CLI, resuming the prior conversation.
+
+```rust
+// crates/kk-agent/src/phases.rs — Phase 1
+let sid_path = paths.claude_session_id_file(&config.group, config.thread_id.as_deref());
+if let Ok(sid) = std::fs::read_to_string(&sid_path) {
+    // Resume prior conversation
+    spawn_claude_with_session(&config.claude_bin, &prompt, sid.trim(), ...);
+} else {
+    // Fresh conversation
+    spawn_claude(&config.claude_bin, &prompt, ...);
+}
+// After claude finishes: extract session_id from response.jsonl, persist to file
+```
+
+This follows the same pattern as OpenClaw (CLI mode), NanoClaw, and IronClaw (bridge) — capture session_id from output, persist, pass `--resume <id>` on next spawn. Thread-aware: each `(group, thread_id)` pair maintains its own session.
 
 ---
 
@@ -393,14 +408,24 @@ On each message:
 Cold path (no running Job):
 1. Connector polls platform → writes inbound nq file to /data/inbox/{channel}/
 2. Gateway inbound loop (2s) → reads nq → resolves group/thread
+   - If "/stop" command → write _stop sentinel to queue dir → skip Job creation
 3. Gateway writes /data/results/{session-id}/request.json
 4. Gateway creates K8s Job with env: SESSION_ID, GROUP, THREAD_ID, etc.
 5. Agent Phase 0: symlink skills from /data/skills/
-6. Agent Phase 1: read request.json → build prompt → spawn claude -p
+6. Agent Phase 1: read request.json → build prompt
+   - Check for persisted claude_session_id → spawn with --resume <id> if found
+   - After spawn: extract session_id from response.jsonl → persist to PVC
+   - Check for context overflow → write status=overflow if detected
 7. Agent Phase 2: poll /data/groups/{group}/ for follow-up nq files (2s)
-   → spawn claude -p --resume for each
-8. Agent Phase 3: write "done" to status file
-9. Gateway results loop → read response.jsonl → write to /data/outbox/
+   - Check _stop sentinel before each poll → write status=stopped if found
+   - spawn claude -p --resume for each follow-up
+   - Check for context overflow after each spawn
+8. Agent Phase 3: write "done" to status file (skipped if stopped/overflow)
+9. Gateway results loop:
+   - status=running → stream partial response from response.jsonl (byte offset tracking)
+   - status=done → read final response → write to /data/outbox/
+   - status=stopped → deliver partial response + "[kk] (stopped by user)"
+   - status=overflow → deliver partial response + overflow message, clear session_id
 10. Connector polls outbox → delivers to platform
 
 Hot path (Job already running):
@@ -468,7 +493,7 @@ class MessageStream {
 | **IronClaw** | `compact_messages_for_retry()` — strip oldest messages, keep system + last turn. |
 | **PicoClaw** | Emergency compression: drop oldest 50% of conversation. Up to 2 retries. |
 | **ZeroClaw** | `compact_sender_history()` — keep last 12 messages, truncate to 600 chars. |
-| **kk** | Not handled at agent level — relies on Claude CLI's own limits (`--max-turns`). |
+| **kk** | Agent scans `response.jsonl` and `agent.log` for overflow patterns (`context_length_exceeded`, `maximum context length`). On detection: writes `status=overflow`, Gateway sends partial response + overflow message, clears persisted `claude_session_id` so next Job starts fresh. |
 
 ### Agent/Process Crash
 
@@ -563,15 +588,16 @@ Parsed incrementally as data arrives, but each marker represents a complete resp
 
 **PicoClaw:** Full buffered response. Shows "Thinking..." placeholder, then edits it with the final answer.
 
-**kk (ours):** Store-and-forward via files. Claude CLI writes JSONL to `response.jsonl` incrementally, but Gateway waits for `status=done` before reading:
+**kk (ours):** Incremental file-based streaming. Gateway tails `response.jsonl` while `status=running`, forwarding partial responses to users:
 ```
 Agent writes stream-json → response.jsonl (real-time on disk)
 Gateway polls status file every 2s
-On "done": reads last "type":"result" line → writes to outbox
+On "running": read new bytes since last offset → extract latest text → write to outbox with meta.streaming=true
+On "done": send final response → archive
 Connector polls outbox every 1s → delivers to platform
 ```
 
-The JSONL file *does* contain real-time streaming data — the Gateway just doesn't read it until completion.
+The streaming implementation uses byte offset tracking (`stream_offsets: HashMap<String, u64>`) to avoid re-reading. Each poll reads only new bytes appended since the last check, extracts the latest `assistant` or `result` text block, and sends it as an `OutboundMessage` with `meta.streaming: true`. The connector can use this flag to update an existing message rather than posting a new one.
 
 ---
 
@@ -586,7 +612,7 @@ The JSONL file *does* contain real-time streaming data — the Gateway just does
 | **IronClaw** | `/interrupt` command → `ThreadState::Interrupted` → checked at each loop iteration |
 | **PicoClaw** | No explicit mechanism — messages processed sequentially |
 | **ZeroClaw** | Per-sender `CancellationToken` — new message cancels in-flight request |
-| **kk** | No user-initiated stop — relies on K8s `activeDeadlineSeconds` |
+| **kk** | `/stop` command → Gateway writes `_stop` sentinel file to queue dir → Agent Phase 2 detects sentinel → writes `status=stopped` → partial response delivered |
 
 ### Graceful Shutdown
 
@@ -597,7 +623,7 @@ The JSONL file *does* contain real-time streaming data — the Gateway just does
 | **IronClaw** | Tokio task cancellation, container auto-remove |
 | **PicoClaw** | Context cancellation via Go context |
 | **ZeroClaw** | Component supervisor stops, tasks cancelled |
-| **kk** | K8s sends SIGTERM to pod, `activeDeadlineSeconds` hard limit |
+| **kk** | K8s sends SIGTERM to pod, `activeDeadlineSeconds` hard limit. Agent checks `_stop` sentinel before each Phase 2 follow-up poll. |
 
 ---
 
@@ -619,53 +645,51 @@ The JSONL file *does* contain real-time streaming data — the Gateway just does
 |---------|----------|----------|----------|----------|----------|------|
 | Storage | JSONL files | SQLite + .claude/ dir | In-memory + PostgreSQL | JSON files | In-memory + SQLite vectors | PVC files |
 | Survives restart | Yes | Yes | Yes (with DB) | Yes | Partial (memory only) | Yes |
-| Cross-session resume | `--resume {id}` | SDK `resume: id` | `--resume` (bridge) | No (full replay) | No | `--resume` (within Job) |
-| Auto-compaction | Yes (LLM summary) | SDK internal | Yes (strip oldest) | Yes (LLM summary) | Yes (keep last 12) | No |
+| Cross-session resume | `--resume {id}` | SDK `resume: id` | `--resume` (bridge) | No (full replay) | No | `--resume {id}` (cross-Job via PVC) |
+| Auto-compaction | Yes (LLM summary) | SDK internal | Yes (strip oldest) | Yes (LLM summary) | Yes (keep last 12) | Overflow detection + session reset |
 
 ### Streaming
 
 | Feature | OpenClaw | NanoClaw | IronClaw | PicoClaw | ZeroClaw | kk |
 |---------|----------|----------|----------|----------|----------|------|
-| Token streaming | Yes (embedded) | No | Yes (SSE) | No | Yes (draft updates) | No |
-| Typing indicator | Via channel | Yes | Via StatusUpdate | Placeholder msg | Via draft | No |
-| Partial results | Every 150ms | Marker-based chunks | Per-event | No | 80-char minimum | No |
+| Token streaming | Yes (embedded) | No | Yes (SSE) | No | Yes (draft updates) | Yes (file-based, per-poll) |
+| Typing indicator | Via channel | Yes | Via StatusUpdate | Placeholder msg | Via draft | Via `meta.streaming` flag |
+| Partial results | Every 150ms | Marker-based chunks | Per-event | No | 80-char minimum | Per poll cycle (2s) |
 
 ---
 
 ## 10. Lessons for kk
 
-### What We Could Adopt
+### What We Adopted (Implemented)
 
-#### 1. Streaming: Read response.jsonl Incrementally
-kk already has real-time JSONL data — Claude CLI writes `stream-json` output line by line. The Gateway currently waits for `status=done`. We could:
-- **Tail `response.jsonl`** and forward partial `assistant` blocks to the outbox as they appear
-- Use a simple "last seen offset" to avoid re-reading
-- This is essentially what NanoClaw's stdout marker parsing does, but we'd read from a file instead of stdout
+#### 1. ✅ Streaming: Read response.jsonl Incrementally
+Gateway now tails `response.jsonl` while `status=running` using byte offset tracking (`stream_offsets` in `SharedState`). Each poll reads only new bytes, extracts the latest assistant/result text, and sends it as an `OutboundMessage` with `meta.streaming: true`. Connectors can use this flag to update an existing message rather than posting a new one.
 
-#### 2. Session Resume Across Jobs
-Currently `--resume` only works within a single Job's Phase 2. To enable cross-Job resume:
-- **Capture session_id** from Claude's `stream-json` output (the `system/init` event contains it)
-- **Store it** in a file at `/data/sessions/{group}/session_id`
-- **Pass `--resume {id}`** on the next Job's Phase 1 spawn
-- This is exactly how OpenClaw (CLI mode), NanoClaw, and IronClaw (bridge) all do it
+**Implementation:** `crates/kk-gateway/src/loops/results.rs` — `try_stream_partial()`
 
-#### 3. Message Injection During Active Query
+#### 2. ✅ Session Resume Across Jobs
+Agent Phase 1 now captures `session_id` from Claude's `stream-json` output and persists it to `/data/sessions/{group}/claude_session_id`. On next Job startup, reads this file and passes `--resume <session_id>` to the CLI. Thread-aware: each `(group, thread_id)` pair maintains its own session.
+
+**Implementation:** `crates/kk-agent/src/phases.rs` — `phase_1_prompt()` + `extract_claude_session_id()`, `crates/kk-agent/src/claude.rs` — `spawn_claude_with_session()`
+
+#### 3. ✅ User-Initiated Stop
+Gateway detects `/stop` command in inbound messages and writes a `_stop` sentinel file to the group queue directory (like NanoClaw's `_close` pattern). Agent Phase 2 checks for the sentinel before each follow-up poll — if found, writes `status=stopped` and exits. Gateway delivers partial response with "[kk] (stopped by user)" suffix.
+
+**Implementation:** `crates/kk-gateway/src/loops/inbound.rs` — `is_stop_command()` + `handle_stop()`, `crates/kk-agent/src/phases.rs` — sentinel check in Phase 2 loop, `crates/kk-gateway/src/loops/results.rs` — `process_stopped()`
+
+#### 4. ✅ Context Overflow Handling
+Agent scans `response.jsonl` and `agent.log` for overflow patterns (`context_length_exceeded`, `maximum context length`, etc.) after Phase 1 and each Phase 2 resume. On detection: writes `status=overflow`, Gateway sends partial response + overflow message, and clears the persisted `claude_session_id` so the next Job starts a fresh conversation.
+
+**Implementation:** `crates/kk-agent/src/phases.rs` — `detect_context_overflow()`, `crates/kk-gateway/src/loops/results.rs` — `process_overflow()`
+
+### What We Could Still Adopt
+
+#### 1. Message Injection During Active Query
 OpenClaw's "steering" and NanoClaw's `MessageStream` both allow injecting messages into a running LLM query without restarting. This is a limitation of using `claude -p` — the CLI doesn't support mid-query injection. Options:
 - **Switch to Claude Agent SDK** (like NanoClaw) for programmatic control
 - **Accept the 2s poll latency** in Phase 2 (current approach, works fine)
 
-#### 4. Context Overflow Handling
-All other projects handle context overflow at the orchestrator level. kk relies entirely on Claude CLI's `--max-turns`. We could:
-- Monitor `response.jsonl` for context length warnings
-- Implement compaction at the Gateway level before creating follow-up prompts
-
-#### 5. User-Initiated Stop
-Every project except kk supports user-initiated interruption. Options:
-- Write a `_stop` sentinel file to the queue directory (like NanoClaw's `_close`)
-- Agent Phase 2 detects it and exits immediately
-- Gateway marks the Job for deletion
-
-#### 6. Error Recovery with Cursor Rollback
+#### 2. Error Recovery with Cursor Rollback
 NanoClaw's pattern of rolling back the message cursor on error (only if no output was sent to the user) prevents message loss:
 ```typescript
 if (hadError && !outputSentToUser) {
@@ -690,8 +714,9 @@ Because everything is files, kk conversations can be replayed by re-creating the
 
 ### Priority Improvements
 
-1. **High: Cross-Job session resume** — capture and persist session_id from stream-json output
-2. **High: Streaming responses** — tail response.jsonl incrementally instead of waiting for "done"
-3. **Medium: User-initiated stop** — `_stop` sentinel file pattern
-4. **Medium: Context overflow handling** — detect and compact at Gateway level
+1. ~~**High: Cross-Job session resume** — capture and persist session_id from stream-json output~~ ✅ Implemented
+2. ~~**High: Streaming responses** — tail response.jsonl incrementally instead of waiting for "done"~~ ✅ Implemented
+3. ~~**Medium: User-initiated stop** — `_stop` sentinel file pattern~~ ✅ Implemented
+4. ~~**Medium: Context overflow handling** — detect and notify, reset session for fresh start~~ ✅ Implemented
 5. **Low: Error cursor rollback** — prevent message loss on agent failures
+6. **Low: Message injection** — inject follow-ups into running LLM query (requires SDK migration)
