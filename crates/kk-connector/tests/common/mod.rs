@@ -155,7 +155,7 @@ pub fn make_outbound_meta(meta_key: &str, chat_id: &str) -> serde_json::Value {
 ///     expected_channel_type: kk_core::types::ChannelType::Telegram,
 ///     expected_auto_slug: "tg-1001234567890",
 ///     meta_chat_id_key: "chat_id",
-///     dummy_sender: || { ProviderSender::Telegram(teloxide::Bot::new("0:fake")) },
+///     dummy_sender: || { TelegramOutbound::new(teloxide::Bot::new("0:fake")) },
 /// }
 /// ```
 macro_rules! provider_e2e_tests {

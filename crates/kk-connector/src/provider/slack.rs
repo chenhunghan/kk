@@ -1,6 +1,7 @@
 use std::collections::HashMap;
 
 use anyhow::{Context, Result, bail};
+use async_trait::async_trait;
 use futures_util::{SinkExt, StreamExt};
 use tokio::sync::mpsc;
 use tokio_tungstenite::connect_async;
@@ -10,20 +11,143 @@ use tracing::{debug, error, info, warn};
 use kk_core::text::split_text;
 use kk_core::types::OutboundMessage;
 
-use super::{ConnectorEvent, InboundRaw};
+use super::{ChatProvider, ConnectorEvent, InboundRaw};
 
 const SLACK_MAX_MESSAGE_LEN: usize = 4000;
 
 /// Handle for sending outbound messages via Slack Web API.
 #[derive(Clone)]
-pub struct SlackSender {
+pub struct SlackOutbound {
     bot_token: String,
     client: reqwest::Client,
 }
 
-impl SlackSender {
+impl SlackOutbound {
     pub fn new(bot_token: String, client: reqwest::Client) -> Self {
         Self { bot_token, client }
+    }
+}
+
+#[async_trait]
+impl ChatProvider for SlackOutbound {
+    async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        let channel_id = extract_channel_id(msg)?;
+
+        let chunks = split_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
+        for (i, chunk) in chunks.iter().enumerate() {
+            let mut body = serde_json::json!({
+                "channel": channel_id,
+                "text": chunk,
+            });
+
+            // Thread the reply if thread_id is set
+            if let Some(ref thread_ts) = msg.thread_id {
+                body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
+            }
+
+            // If first chunk has a reply_to_ts and we're not already in a thread,
+            // reply in a thread
+            if i == 0
+                && msg.thread_id.is_none()
+                && let Some(reply_ts) = msg.meta.get("reply_to_ts").and_then(|v| v.as_str())
+            {
+                body["thread_ts"] = serde_json::Value::String(reply_ts.to_string());
+            }
+
+            let resp: serde_json::Value = self
+                .client
+                .post("https://slack.com/api/chat.postMessage")
+                .bearer_auth(&self.bot_token)
+                .json(&body)
+                .send()
+                .await
+                .with_context(|| format!("failed to send slack message to channel {channel_id}"))?
+                .json()
+                .await
+                .context("failed to parse chat.postMessage response")?;
+
+            if !resp["ok"].as_bool().unwrap_or(false) {
+                let error = resp["error"].as_str().unwrap_or("unknown");
+                bail!("chat.postMessage failed for channel {channel_id}: {error}");
+            }
+
+            // Rate limit buffer between chunks
+            if chunks.len() > 1 && i < chunks.len() - 1 {
+                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
+            }
+        }
+
+        Ok(())
+    }
+
+    async fn send_returning_id(&self, msg: &OutboundMessage) -> Result<String> {
+        let channel_id = extract_channel_id(msg)?;
+
+        let text = truncate_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
+        let mut body = serde_json::json!({
+            "channel": channel_id,
+            "text": text,
+        });
+
+        if let Some(ref thread_ts) = msg.thread_id {
+            body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
+        } else if let Some(reply_ts) = msg.meta.get("reply_to_ts").and_then(|v| v.as_str()) {
+            body["thread_ts"] = serde_json::Value::String(reply_ts.to_string());
+        }
+
+        let resp: serde_json::Value = self
+            .client
+            .post("https://slack.com/api/chat.postMessage")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("failed to send slack message to channel {channel_id}"))?
+            .json()
+            .await
+            .context("failed to parse chat.postMessage response")?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let error = resp["error"].as_str().unwrap_or("unknown");
+            bail!("chat.postMessage failed for channel {channel_id}: {error}");
+        }
+
+        let ts = resp["ts"]
+            .as_str()
+            .context("missing ts in chat.postMessage response")?;
+        Ok(ts.to_string())
+    }
+
+    async fn edit(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> {
+        let channel_id = extract_channel_id(msg)?;
+
+        let text = truncate_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "ts": platform_msg_id,
+            "text": text,
+        });
+
+        let resp: serde_json::Value = self
+            .client
+            .post("https://slack.com/api/chat.update")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| {
+                format!("failed to edit slack message {platform_msg_id} in channel {channel_id}")
+            })?
+            .json()
+            .await
+            .context("failed to parse chat.update response")?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let error = resp["error"].as_str().unwrap_or("unknown");
+            bail!("chat.update failed for channel {channel_id}: {error}");
+        }
+
+        Ok(())
     }
 }
 
@@ -79,8 +203,8 @@ impl SlackProvider {
     }
 
     /// Create a sender handle for the outbound poller.
-    pub fn sender(&self) -> SlackSender {
-        SlackSender {
+    pub fn sender(&self) -> SlackOutbound {
+        SlackOutbound {
             bot_token: self.bot_token.clone(),
             client: self.client.clone(),
         }
@@ -322,61 +446,21 @@ impl SlackProvider {
             None
         }
     }
+}
 
-    /// Send an outbound message to Slack via Web API.
-    /// Splits long messages at the 4000-char limit.
-    pub async fn send(sender: &SlackSender, msg: &OutboundMessage) -> Result<()> {
-        let channel_id = msg
-            .meta
-            .get("channel_id")
-            .and_then(|v| v.as_str())
-            .context("outbound message missing meta.channel_id")?;
+fn extract_channel_id(msg: &OutboundMessage) -> Result<String> {
+    msg.meta
+        .get("channel_id")
+        .and_then(|v| v.as_str())
+        .map(|s| s.to_string())
+        .context("outbound message missing meta.channel_id")
+}
 
-        let chunks = split_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
-        for (i, chunk) in chunks.iter().enumerate() {
-            let mut body = serde_json::json!({
-                "channel": channel_id,
-                "text": chunk,
-            });
-
-            // Thread the reply if thread_id is set
-            if let Some(ref thread_ts) = msg.thread_id {
-                body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
-            }
-
-            // If first chunk has a reply_to_ts and we're not already in a thread,
-            // reply in a thread
-            if i == 0
-                && msg.thread_id.is_none()
-                && let Some(reply_ts) = msg.meta.get("reply_to_ts").and_then(|v| v.as_str())
-            {
-                body["thread_ts"] = serde_json::Value::String(reply_ts.to_string());
-            }
-
-            let resp: serde_json::Value = sender
-                .client
-                .post("https://slack.com/api/chat.postMessage")
-                .bearer_auth(&sender.bot_token)
-                .json(&body)
-                .send()
-                .await
-                .with_context(|| format!("failed to send slack message to channel {channel_id}"))?
-                .json()
-                .await
-                .context("failed to parse chat.postMessage response")?;
-
-            if !resp["ok"].as_bool().unwrap_or(false) {
-                let error = resp["error"].as_str().unwrap_or("unknown");
-                bail!("chat.postMessage failed for channel {channel_id}: {error}");
-            }
-
-            // Rate limit buffer between chunks
-            if chunks.len() > 1 && i < chunks.len() - 1 {
-                tokio::time::sleep(std::time::Duration::from_millis(200)).await;
-            }
-        }
-
-        Ok(())
+fn truncate_text(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        text.to_string()
+    } else {
+        text[..max_len].to_string()
     }
 }
 

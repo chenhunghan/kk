@@ -8,8 +8,8 @@ use kk_connector::config::ConnectorConfig;
 use kk_connector::groups::GroupMap;
 use kk_connector::inbound::process_inbound;
 use kk_connector::outbound::poll_outbound;
+use kk_connector::provider::ChatProvider;
 use kk_connector::provider::ConnectorEvent;
-use kk_connector::provider::ProviderSender;
 use kk_connector::provider::slack::SlackProvider;
 use kk_connector::provider::telegram::TelegramProvider;
 
@@ -40,7 +40,7 @@ async fn main() -> Result<()> {
     let (inbound_tx, inbound_rx) = mpsc::channel::<ConnectorEvent>(256);
 
     // Initialize provider-specific inbound dispatcher and outbound sender
-    let (inbound_handle, sender): (JoinHandle<()>, ProviderSender) =
+    let (inbound_handle, sender): (JoinHandle<()>, Box<dyn ChatProvider>) =
         match config.channel_type.as_str() {
             "telegram" => {
                 let token = config
@@ -49,14 +49,14 @@ async fn main() -> Result<()> {
                     .context("TELEGRAM_BOT_TOKEN required for telegram channel type")?;
 
                 let telegram = TelegramProvider::new(token).await?;
-                let bot = telegram.bot();
+                let sender = Box::new(telegram.sender());
                 info!(bot_username = telegram.bot_username(), "bot identity");
 
                 let handle = tokio::spawn(async move {
                     telegram.run_inbound(inbound_tx).await;
                 });
 
-                (handle, ProviderSender::Telegram(bot))
+                (handle, sender)
             }
             "slack" => {
                 let bot_token = config
@@ -70,13 +70,13 @@ async fn main() -> Result<()> {
 
                 let slack = SlackProvider::new(bot_token, app_token).await?;
                 info!(bot_user_id = slack.bot_user_id(), "bot identity");
-                let slack_sender = slack.sender();
+                let sender = Box::new(slack.sender());
 
                 let handle = tokio::spawn(async move {
                     slack.run_inbound(inbound_tx).await;
                 });
 
-                (handle, ProviderSender::Slack(slack_sender))
+                (handle, sender)
             }
             other => bail!("unsupported channel type: {other} (supported: telegram, slack)"),
         };
@@ -95,7 +95,7 @@ async fn main() -> Result<()> {
             if let Err(e) = poll_outbound(
                 &outbound_config.outbox_dir,
                 &outbound_config.channel_name,
-                &sender,
+                &*sender,
             )
             .await
             {

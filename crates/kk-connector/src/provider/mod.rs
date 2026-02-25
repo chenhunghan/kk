@@ -2,6 +2,7 @@ pub mod slack;
 pub mod telegram;
 
 use anyhow::Result;
+use async_trait::async_trait;
 
 use kk_core::types::OutboundMessage;
 
@@ -28,17 +29,21 @@ pub enum ConnectorEvent {
     },
 }
 
-/// Abstraction over provider-specific send implementations.
-pub enum ProviderSender {
-    Telegram(teloxide::Bot),
-    Slack(slack::SlackSender),
-}
+/// Trait that every chat platform provider must implement for outbound messaging.
+///
+/// Implementing `send()` + `edit()` gives fallback (edit-in-place) streaming for free.
+/// The outbound loop in `outbound.rs` handles the streaming coordination using these
+/// three methods — no provider needs to know about streaming state files.
+#[async_trait]
+pub trait ChatProvider: Send + Sync {
+    /// Send a new message. May split long messages across multiple platform messages.
+    async fn send(&self, msg: &OutboundMessage) -> Result<()>;
 
-impl ProviderSender {
-    pub async fn send(&self, msg: &OutboundMessage) -> Result<()> {
-        match self {
-            Self::Telegram(bot) => telegram::TelegramProvider::send(bot, msg).await,
-            Self::Slack(sender) => slack::SlackProvider::send(sender, msg).await,
-        }
-    }
+    /// Send a single message and return the platform-specific message ID.
+    /// Used for streaming: the first partial response creates the message.
+    async fn send_returning_id(&self, msg: &OutboundMessage) -> Result<String>;
+
+    /// Edit a previously sent message by its platform-specific ID.
+    /// Used for streaming: updates the same message with new partial content.
+    async fn edit(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()>;
 }

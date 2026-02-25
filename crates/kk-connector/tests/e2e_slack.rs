@@ -7,11 +7,9 @@ common::provider_e2e_tests! {
     expected_auto_slug: "slack-c0123456789",
     meta_chat_id_key: "channel_id",
     dummy_sender: || {
-        kk_connector::provider::ProviderSender::Slack(
-            kk_connector::provider::slack::SlackSender::new(
-                "xoxb-fake-token".into(),
-                reqwest::Client::new(),
-            ),
+        kk_connector::provider::slack::SlackOutbound::new(
+            "xoxb-fake-token".into(),
+            reqwest::Client::new(),
         )
     },
 }

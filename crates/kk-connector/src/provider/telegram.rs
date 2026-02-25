@@ -1,4 +1,5 @@
 use anyhow::{Context, Result};
+use async_trait::async_trait;
 use teloxide::prelude::*;
 use teloxide::types::{ChatMemberStatus, Me, MessageId, ReplyParameters, ThreadId};
 use tokio::sync::mpsc;
@@ -7,7 +8,7 @@ use tracing::{debug, error, info};
 use kk_core::text::split_text;
 use kk_core::types::OutboundMessage;
 
-use super::{ConnectorEvent, InboundRaw};
+use super::{ChatProvider, ConnectorEvent, InboundRaw};
 
 const TELEGRAM_MAX_MESSAGE_LEN: usize = 4096;
 
@@ -33,6 +34,13 @@ impl TelegramProvider {
     /// Returns the bot's username (e.g. `"my_bot"`).
     pub fn bot_username(&self) -> &str {
         self.me.username()
+    }
+
+    /// Create a sender handle for the outbound poller.
+    pub fn sender(&self) -> TelegramOutbound {
+        TelegramOutbound {
+            bot: self.bot.clone(),
+        }
     }
 
     /// Start the inbound message dispatcher.
@@ -149,39 +157,33 @@ impl TelegramProvider {
             .dispatch()
             .await;
     }
+}
 
-    /// Send an outbound message to Telegram.
-    /// Splits long messages at the 4096-char limit.
-    pub async fn send(bot: &Bot, msg: &OutboundMessage) -> Result<()> {
-        let chat_id_str = msg
-            .meta
-            .get("chat_id")
-            .and_then(|v| v.as_str())
-            .context("outbound message missing meta.chat_id")?;
+/// Outbound sender for Telegram — implements `ChatProvider`.
+pub struct TelegramOutbound {
+    bot: Bot,
+}
 
-        let chat_id: ChatId = ChatId(
-            chat_id_str
-                .parse::<i64>()
-                .context("invalid chat_id in meta")?,
-        );
+impl TelegramOutbound {
+    pub fn new(bot: Bot) -> Self {
+        Self { bot }
+    }
+}
 
-        // Parse thread_id for Forum Topics routing
-        let tg_thread_id: Option<ThreadId> = msg
-            .thread_id
-            .as_deref()
-            .and_then(|tid| tid.parse::<i32>().ok())
-            .map(|id| ThreadId(MessageId(id)));
+#[async_trait]
+impl ChatProvider for TelegramOutbound {
+    async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        let (chat_id, chat_id_str) = extract_chat_id(msg)?;
+        let tg_thread_id = extract_thread_id(msg);
 
         let chunks = split_text(&msg.text, TELEGRAM_MAX_MESSAGE_LEN);
         for (i, chunk) in chunks.iter().enumerate() {
-            let mut req = bot.send_message(chat_id, chunk);
+            let mut req = self.bot.send_message(chat_id, chunk);
 
-            // Route to Forum Topic thread if present
             if let Some(tid) = tg_thread_id {
                 req = req.message_thread_id(tid);
             }
 
-            // Only reply-thread the first chunk
             if i == 0
                 && let Some(reply_id) = msg.meta.get("reply_to_message_id")
                 && let Some(id) = reply_id.as_i64()
@@ -193,7 +195,6 @@ impl TelegramProvider {
                 format!("failed to send telegram message to chat {chat_id_str}")
             })?;
 
-            // Rate limit buffer between chunks
             if chunks.len() > 1 && i < chunks.len() - 1 {
                 tokio::time::sleep(std::time::Duration::from_millis(100)).await;
             }
@@ -202,8 +203,85 @@ impl TelegramProvider {
         Ok(())
     }
 
-    /// Get a clone of the underlying Bot for use in the outbound loop.
-    pub fn bot(&self) -> Bot {
-        self.bot.clone()
+    async fn send_returning_id(&self, msg: &OutboundMessage) -> Result<String> {
+        let (chat_id, chat_id_str) = extract_chat_id(msg)?;
+        let tg_thread_id = extract_thread_id(msg);
+
+        let text = truncate_text(&msg.text, TELEGRAM_MAX_MESSAGE_LEN);
+        let mut req = self.bot.send_message(chat_id, &text);
+
+        if let Some(tid) = tg_thread_id {
+            req = req.message_thread_id(tid);
+        }
+
+        if let Some(reply_id) = msg.meta.get("reply_to_message_id")
+            && let Some(id) = reply_id.as_i64()
+        {
+            req = req.reply_parameters(ReplyParameters::new(MessageId(id as i32)));
+        }
+
+        let sent = req
+            .await
+            .with_context(|| format!("failed to send telegram message to chat {chat_id_str}"))?;
+
+        Ok(sent.id.0.to_string())
+    }
+
+    async fn edit(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> {
+        let (chat_id, chat_id_str) = extract_chat_id(msg)?;
+        let msg_id = MessageId(
+            platform_msg_id
+                .parse::<i32>()
+                .context("invalid telegram message_id")?,
+        );
+
+        let text = truncate_text(&msg.text, TELEGRAM_MAX_MESSAGE_LEN);
+
+        match self.bot.edit_message_text(chat_id, msg_id, &text).await {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                let err_str = e.to_string();
+                // "message is not modified" is expected when text hasn't changed
+                if err_str.contains("message is not modified") {
+                    Ok(())
+                } else {
+                    Err(e).with_context(|| {
+                        format!(
+                            "failed to edit telegram message {platform_msg_id} in chat {chat_id_str}"
+                        )
+                    })
+                }
+            }
+        }
+    }
+}
+
+fn extract_chat_id(msg: &OutboundMessage) -> Result<(ChatId, String)> {
+    let chat_id_str = msg
+        .meta
+        .get("chat_id")
+        .and_then(|v| v.as_str())
+        .context("outbound message missing meta.chat_id")?
+        .to_string();
+    let chat_id = ChatId(
+        chat_id_str
+            .parse::<i64>()
+            .context("invalid chat_id in meta")?,
+    );
+    Ok((chat_id, chat_id_str))
+}
+
+fn extract_thread_id(msg: &OutboundMessage) -> Option<ThreadId> {
+    msg.thread_id
+        .as_deref()
+        .and_then(|tid| tid.parse::<i32>().ok())
+        .map(|id| ThreadId(MessageId(id)))
+}
+
+fn truncate_text(text: &str, max_len: usize) -> String {
+    if text.len() <= max_len {
+        text.to_string()
+    } else {
+        text[..max_len].to_string()
     }
 }
