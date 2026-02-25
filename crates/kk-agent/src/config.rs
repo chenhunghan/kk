@@ -1,6 +1,6 @@
+use crate::agent::CodeAgent;
 use anyhow::{Context, Result};
 use std::env;
-use crate::agent::CodeAgent;
 
 /// Supported agent types.
 pub enum AgentType {
@@ -62,18 +62,18 @@ impl AgentConfig {
             .parse::<u32>()
             .context("MAX_TURNS must be a number")?;
         let thread_id = env::var("THREAD_ID").ok().filter(|s| !s.is_empty());
-        
+
         let agent_type_str = env::var("AGENT_TYPE").unwrap_or_else(|_| "claude".to_string());
         let agent_type = AgentType::from_str(&agent_type_str)
             .with_context(|| format!("invalid AGENT_TYPE: {agent_type_str}"))?;
 
-        let agent_bin = env::var("AGENT_BIN").or_else(|_| env::var("CLAUDE_BIN")).unwrap_or_else(|_| {
-            match agent_type {
+        let agent_bin = env::var("AGENT_BIN")
+            .or_else(|_| env::var("CLAUDE_BIN"))
+            .unwrap_or_else(|_| match agent_type {
                 AgentType::Claude => "claude".to_string(),
                 AgentType::Gemini => "gemini".to_string(),
                 AgentType::Codex => "codex".to_string(),
-            }
-        });
+            });
 
         Ok(Self {
             session_id,

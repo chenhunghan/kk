@@ -1,10 +1,10 @@
 use anyhow::{Context, Result};
+use kk_core::types::ResultLine;
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::process::Command;
-use kk_core::types::ResultLine;
 
-use crate::agent::{CodeAgent, AgentResult};
+use crate::agent::{AgentResult, CodeAgent};
 
 pub struct Claude;
 

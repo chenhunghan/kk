@@ -606,7 +606,7 @@ fn e2e_gemini_lifecycle() {
 
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    
+
     // Create a mock gemini binary that also writes a session_id
     let script = bin_dir.join("mock-gemini");
     let content = r#"#!/bin/bash
@@ -644,7 +644,7 @@ exit 0
 
     // Phase 1
     phases::phase_1_prompt(&config, &paths, &session_dir).unwrap();
-    
+
     // Verify args
     let args = fs::read_to_string(session_dir.join(".last-args")).unwrap();
     assert!(args.contains("-p gemini prompt"));
@@ -676,7 +676,7 @@ fn e2e_codex_lifecycle() {
 
     let bin_dir = tmp.path().join("bin");
     fs::create_dir_all(&bin_dir).unwrap();
-    
+
     // Create a mock codex binary
     let script = bin_dir.join("mock-codex");
     let content = r#"#!/bin/bash
@@ -714,7 +714,7 @@ exit 0
 
     // Phase 1
     phases::phase_1_prompt(&config, &paths, &session_dir).unwrap();
-    
+
     // Verify args
     let args = fs::read_to_string(session_dir.join(".last-args")).unwrap();
     assert!(args.contains("exec codex prompt"));
