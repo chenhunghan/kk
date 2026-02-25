@@ -5,6 +5,7 @@ use tokio::process::Command;
 use tracing::{error, info, warn};
 
 mod config;
+mod terminal;
 
 use config::KkConfig;
 use kk_core::paths::DataPaths;
@@ -46,7 +47,10 @@ async fn main() -> Result<()> {
         warn!(error = %e, "failed to rebuild active jobs from files");
     }
 
-    // 5. Spawn connector child processes
+    // 5. Register terminal channel in groups.d
+    terminal::register_terminal_group(&paths)?;
+
+    // 6. Spawn connector child processes
     let mut connector_children = Vec::new();
     for channel in &kk_config.channels {
         match spawn_connector(&kk_config, channel, &paths) {
@@ -60,21 +64,31 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 6. Run gateway loops in-process
+    // 7. Run gateway loops in-process
     let inbound = tokio::spawn(loops::inbound::run(state.clone()));
     let results = tokio::spawn(loops::results::run(state.clone()));
     let cleanup = tokio::spawn(loops::cleanup::run(state.clone()));
     let state_reload = tokio::spawn(loops::state_reload::run(state.clone()));
 
-    // 7. Spawn connector watchdog (restarts crashed connectors)
-    let watchdog = tokio::spawn(watch_connectors(connector_children, kk_config, paths));
+    // 8. Spawn connector watchdog (restarts crashed connectors)
+    let watchdog = tokio::spawn(watch_connectors(
+        connector_children,
+        kk_config,
+        paths.clone(),
+    ));
 
-    info!("kk is running — press Ctrl+C to stop");
+    // 9. Run terminal connector (foreground — blocks on stdin)
+    let terminal = tokio::spawn(terminal::run(paths));
 
-    // 8. Wait for shutdown or crash
+    info!("kk is running — type a message or press Ctrl+C to stop");
+
+    // 10. Wait for shutdown or crash
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("received Ctrl+C, shutting down");
+        }
+        res = terminal => {
+            info!("terminal exited: {:?}", res);
         }
         res = inbound => {
             error!("inbound loop exited: {:?}", res);

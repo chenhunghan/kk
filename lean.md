@@ -10,10 +10,14 @@ and child processes instead of K8s Jobs, Deployments, and PVCs.
 # Build
 cargo build -p kk-cli -p kk-connector -p kk-agent
 
-# Run with defaults (no config needed)
-kk
+# Run with defaults — opens an interactive terminal session
+ANTHROPIC_API_KEY=sk-... kk
 
-# Or with a config file
+# You'll see a prompt:
+# > hello, what can you do?
+# (agent responds via stdout, streaming in real-time)
+
+# Or with external channels too
 cat > kk.yaml <<'EOF'
 data_dir: ./data
 channels:
@@ -23,6 +27,7 @@ channels:
       TELEGRAM_BOT_TOKEN: "bot123:ABC..."
 EOF
 kk
+# Terminal is always available alongside external channels
 ```
 
 ## How It Works
@@ -31,12 +36,13 @@ kk
 
 ```
 kk (crates/kk-cli)
+├── terminal connector (in-process, interactive stdin/stdout)
 ├── gateway loops (in-process)
 │   ├── inbound   — polls ./data/inbound/, routes messages
 │   ├── results   — polls ./data/results/*/status, writes outbox
 │   ├── cleanup   — detects crashed agents, purges archives
 │   └── state_reload — reloads groups config from disk
-├── connector child processes (one per channel)
+├── connector child processes (one per channel in kk.yaml)
 │   ├── kk-connector [CHANNEL_TYPE=telegram, CHANNEL_NAME=my-telegram]
 │   └── kk-connector [CHANNEL_TYPE=slack, CHANNEL_NAME=my-slack]
 └── agent child processes (spawned on demand)
@@ -47,10 +53,40 @@ The `kk` binary runs the gateway routing logic in-process and spawns
 connectors and agents as child processes. A watchdog loop monitors
 connector processes and restarts them if they crash.
 
-### Data Flow
+### Terminal Channel
 
-The data flow is identical to K8s mode. All components communicate
-through files on the shared `data_dir` directory:
+When `kk` starts, it automatically registers a **terminal** channel
+(`crates/kk-cli/src/terminal.rs`) that provides an interactive CLI
+experience — just like chatting with Claude Code, but going through the
+full queue infrastructure:
+
+```
+stdin (user types)
+     ↓
+terminal connector → ./data/inbound/*.nq      (InboundMessage, channel="terminal")
+     ↓
+gateway inbound loop → spawns kk-agent
+     ↓
+kk-agent runs Claude → ./data/results/{session}/response.jsonl
+     ↓
+gateway results loop → ./data/outbox/terminal/*.nq
+     ↓
+terminal connector (outbound poller) → stdout
+```
+
+The terminal channel auto-registers itself in `groups.d/terminal.json`
+with `trigger_mode: always`. It supports streaming: partial responses
+appear in real-time via `./data/stream/terminal/`, with the final
+response delivered through the outbox.
+
+No configuration needed — the terminal channel is always active when
+running `kk`.
+
+### Data Flow (External Channels)
+
+The data flow for external channels (Telegram, Slack, etc.) is identical
+to K8s mode. All components communicate through files on the shared
+`data_dir` directory:
 
 ```
 Platform API
