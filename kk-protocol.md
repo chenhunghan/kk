@@ -3,8 +3,8 @@
 > **Cross-references:**
 > [Controller](kk-controller.md) ·
 > [Connector](kk-connector.md) ·
-> [Gateway](kubeclaw-plan-gateway.md) ·
-> [Agent Job](kubeclaw-plan-agent-job.md) ·
+> [Gateway](kk-gateway.md) ·
+> [Agent Job](kk-agent.md) ·
 > [Skill](kubeclaw-plan-skill.md)
 
 This document is the single source of truth for how all kk components communicate. Every file path, message format, polling interval, and nq convention is defined here. Component plans reference this document — they do not redefine protocol details.
@@ -30,6 +30,14 @@ There are **no network calls** between components (no HTTP, no gRPC, no TCP sock
 **Thread** — A thread represents a sub-conversation within a group (e.g. a Telegram Forum Topic, Slack thread, or Discord thread). The routing key is `(group, thread_id)` — each pair gets its own agent job, follow-up queue, and session state. `thread_id` is `Option<String>` (`None` for non-threaded chats, string for threaded — Telegram uses integers-as-strings like `"42"`, Slack uses timestamps like `"1708801285.000050"`). Trigger config is per-group; all threads in a group share the same trigger pattern.
 
 **Channel** — A channel represents a single bot connection to a messaging provider (e.g. one Telegram bot). Each channel has its own Connector Deployment and its own outbox queue (`/data/outbox/{channel}/`). A group can span multiple channels (e.g. the same conversation bridged across Telegram and Slack), though typically it's one channel per group.
+
+**Agent** — An Agent is an ephemeral K8s Job (a short-lived pod) that runs the Claude CLI. It mounts the same shared PVC, reads its `request.json` for context, processes the user's message, writes `response.jsonl` with the result, and sets the status file to `"done"` or `"error"`. Once finished, the pod terminates. The Gateway creates Agents — Agents never create themselves.
+
+**Job** — A Job is the K8s `batch/v1 Job` resource that wraps an Agent pod. Each Job is labeled with `app=kk-agent`, `kk.io/group`, `kk.io/session-id`, and optionally `kk.io/thread-id`. The Gateway tracks running Jobs in its in-memory `active_jobs` map (keyed by routing key: `"group"` or `"group|thread_id"`). The cleanup loop deletes finished Jobs and detects crashed ones.
+
+**Cold Path** — The cold path is triggered when no active Job exists for a routing key. The Gateway creates a new session directory, writes `request.json`, and calls the K8s API to launch a new Agent Job. This is the expensive path (~seconds for pod spin-up).
+
+**Hot Path** — The hot path is triggered when a Job is already running for a routing key. The Gateway simply enqueues a `FollowUpMessage` file to `/data/groups/{group}/*.nq` (or the threaded subdirectory). The running Agent polls this directory and picks up the message via `claude --resume`. This is the cheap path (~instant file write). The idle timer on the Agent resets each time a follow-up arrives, keeping the session alive as long as users keep talking (up to `activeDeadlineSeconds`).
 
 ---
 
