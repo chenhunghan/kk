@@ -1,4 +1,9 @@
+pub mod slack;
 pub mod telegram;
+
+use anyhow::Result;
+
+use kk_core::types::OutboundMessage;
 
 /// Raw inbound data from a provider, before normalization.
 #[derive(Debug)]
@@ -21,4 +26,19 @@ pub enum ConnectorEvent {
         chat_id: String,
         chat_title: Option<String>,
     },
+}
+
+/// Abstraction over provider-specific send implementations.
+pub enum ProviderSender {
+    Telegram(teloxide::Bot),
+    Slack(slack::SlackSender),
+}
+
+impl ProviderSender {
+    pub async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+        match self {
+            Self::Telegram(bot) => telegram::TelegramProvider::send(bot, msg).await,
+            Self::Slack(sender) => slack::SlackProvider::send(sender, msg).await,
+        }
+    }
 }

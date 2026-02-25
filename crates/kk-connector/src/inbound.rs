@@ -4,7 +4,7 @@ use tokio::sync::mpsc;
 use tracing::{error, info};
 
 use kk_core::nq;
-use kk_core::types::{ChannelType, InboundMessage};
+use kk_core::types::InboundMessage;
 
 use crate::config::ConnectorConfig;
 use crate::groups::GroupMap;
@@ -15,13 +15,16 @@ pub async fn process_inbound(
     config: &ConnectorConfig,
     mut group_map: GroupMap,
 ) {
+    let channel_type = config.channel_type_enum();
+    let slug_prefix = config.slug_prefix();
+
     while let Some(event) = rx.recv().await {
         match event {
             ConnectorEvent::NewChat {
                 chat_id,
                 chat_title,
             } => {
-                let slug = group_map.register(&chat_id, &config.channel_name);
+                let slug = group_map.register(&chat_id, slug_prefix);
                 if let Err(e) = group_map.persist(&config.groups_d_file, &config.channel_name) {
                     error!(error = %e, "failed to persist groups.d file");
                 }
@@ -31,7 +34,7 @@ pub async fn process_inbound(
                 let group = match group_map.resolve(&raw.chat_id) {
                     Some(g) => g,
                     None => {
-                        let slug = group_map.register(&raw.chat_id, &config.channel_name);
+                        let slug = group_map.register(&raw.chat_id, slug_prefix);
                         if let Err(e) =
                             group_map.persist(&config.groups_d_file, &config.channel_name)
                         {
@@ -47,7 +50,7 @@ pub async fn process_inbound(
 
                 let msg = InboundMessage {
                     channel: config.channel_name.clone(),
-                    channel_type: ChannelType::Telegram,
+                    channel_type: channel_type.clone(),
                     group,
                     thread_id: raw.thread_id,
                     sender: raw.sender_name,

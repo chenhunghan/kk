@@ -53,6 +53,7 @@ Provider credentials come from the Secret via `envFrom`:
 | Provider | Required Env Vars |
 |---|---|
 | Telegram | `TELEGRAM_BOT_TOKEN` |
+| Slack | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` |
 
 Tuning vars (optional):
 
@@ -75,8 +76,9 @@ crates/kk-connector/
     ├── outbound.rs          ← outbound poller (nq files → provider API)
     ├── groups.rs            ← GroupMap: chat_id → group slug, auto-registration
     └── provider/
-        ├── mod.rs           ← InboundRaw struct, ConnectorEvent enum
-        └── telegram.rs      ← TelegramProvider (teloxide)
+        ├── mod.rs           ← InboundRaw, ConnectorEvent, ProviderSender enum
+        ├── telegram.rs      ← TelegramProvider (teloxide)
+        └── slack.rs         ← SlackProvider (Socket Mode + Web API)
 ```
 
 Shared code in `kk-core`:
@@ -95,7 +97,7 @@ crates/kk-core/src/
 
 ```
 1. Read env vars via ConnectorConfig::from_env()
-2. Validate CHANNEL_TYPE is a supported provider (currently: "telegram")
+2. Validate CHANNEL_TYPE is a supported provider (currently: "telegram", "slack")
 3. Validate provider-specific credentials present
 4. Ensure directories: mkdir -p INBOUND_DIR, OUTBOX_DIR, groups.d parent
 5. Initialize provider (e.g. TelegramProvider validates token via get_me())
@@ -274,6 +276,9 @@ K8s sends SIGTERM, waits `terminationGracePeriodSeconds` (default 30s), then SIG
 | Crate | Purpose |
 |---|---|
 | `teloxide` 0.13 | Telegram provider (long-poll dispatcher) |
+| `reqwest` 0.12 | Slack Web API HTTP client |
+| `tokio-tungstenite` 0.26 | Slack Socket Mode WebSocket client |
+| `futures-util` 0.3 | Stream/Sink extensions for WebSocket |
 | `tokio` | Async runtime, mpsc channels, timers |
 | `serde` / `serde_json` | Message serialization |
 | `tracing` | Structured JSON logging |
@@ -282,6 +287,17 @@ K8s sends SIGTERM, waits `terminationGracePeriodSeconds` (default 30s), then SIG
 ---
 
 ## Providers
+
+### ProviderSender (`provider/mod.rs`)
+
+Enum dispatching outbound sends to the correct provider:
+
+```rust
+pub enum ProviderSender {
+    Telegram(teloxide::Bot),
+    Slack(SlackSender),
+}
+```
 
 ### Telegram (`provider/telegram.rs`)
 
@@ -292,6 +308,46 @@ Uses `teloxide` with a long-poll dispatcher. Two handler branches:
 
 Outbound: parses `meta.chat_id` as `ChatId`, optionally sets `message_thread_id` for Forum Topics, splits at 4096 chars, sets `reply_parameters` on first chunk.
 
+Auto-registration slug: `tg-{abs(chat_id)}` (e.g. `-1001234567890` → `tg-1001234567890`).
+
+### Slack (`provider/slack.rs`)
+
+Uses **Socket Mode** (WebSocket) for inbound — no HTTP server needed, connection is connector-initiated. Uses Slack **Web API** (`chat.postMessage`) for outbound.
+
+**Credentials:**
+- `SLACK_BOT_TOKEN` (`xoxb-...`) — for Web API calls
+- `SLACK_APP_TOKEN` (`xapp-...`) — for Socket Mode WebSocket connection
+
+**Inbound (Socket Mode):**
+1. Calls `apps.connections.open` with app token → gets `wss://` URL
+2. Connects via WebSocket, receives envelope payloads
+3. Acknowledges each envelope with `{"envelope_id": "..."}`
+4. Handles `events_api` envelopes:
+   - **`message` event** — filters bot messages and subtypes (edits, deletes), extracts `InboundRaw`, sends `ConnectorEvent::Message`
+   - **`member_joined_channel` event** — detects bot added to channel, sends `ConnectorEvent::NewChat`
+5. Auto-reconnects on disconnect or error (5s backoff)
+
+**Outbound:**
+- Parses `meta.channel_id` to target the Slack channel
+- Splits at 4000 chars (Slack practical limit)
+- Sets `thread_ts` for threaded replies when `thread_id` is present
+- Supports `meta.reply_to_ts` to start a thread from a specific message
+
+**User name resolution:**
+- Calls `users.info` to resolve user IDs to display names
+- Results cached in memory (RwLock HashMap) to avoid repeated API calls
+
+**Metadata fields:**
+```json
+{
+    "channel_id": "C0123456789",
+    "message_ts": "1234567890.123456",
+    "user_id": "U0123456789"
+}
+```
+
+Auto-registration slug: `slack-{channel_id}` (e.g. `C0123456789` → `slack-c0123456789`).
+
 ---
 
 ## Testing Checklist
@@ -301,7 +357,7 @@ Outbound: parses `meta.chat_id` as `ChatId`, optionally sets `message_thread_id`
 - [ ] Bot messages filtered out
 - [ ] Non-text messages filtered out
 - [x] Group mapping resolves chat ID → group slug
-- [x] Unmapped chat ID → auto-registered with `tg-{id}` slug
+- [x] Unmapped chat ID → auto-registered with `{prefix}-{id}` slug
 - [x] Atomic write: no partial files in inbound dir
 - [x] groups.d file missing → connector starts with empty mappings
 
@@ -321,12 +377,24 @@ Outbound: parses `meta.chat_id` as `ChatId`, optionally sets `message_thread_id`
 - [ ] Outbound without `thread_id` → sent normally
 
 ### Auto-Registration
-- [x] Unmapped chat_id from message → auto-register → groups.d file written → message enqueued with `tg-{id}` slug
+- [x] Unmapped chat_id from message → auto-register → groups.d file written → message enqueued with `{prefix}-{id}` slug
 - [x] Bot added to new group → groups.d file written
 - [x] Already-mapped chat_id → existing slug preserved, no overwrite
 - [x] Second message reuses slug from in-memory map
 - [x] groups.d file persists across restarts (load picks it up)
 
+### Slack-Specific
+- [ ] Socket Mode connects and receives `hello`
+- [ ] Socket Mode auto-reconnects on disconnect
+- [ ] Bot messages (`bot_id` present) filtered out
+- [ ] Message subtypes (edits, deletes) filtered out
+- [ ] `member_joined_channel` for bot → `ConnectorEvent::NewChat`
+- [ ] User name resolved via `users.info` and cached
+- [ ] Outbound `thread_ts` set for threaded replies
+- [ ] Auto-registration slug uses `slack-{channel_id}` (lowercased)
+
 ### Unit Tests (in code)
 - [x] `text::split_text` — empty, under limit, newline split, space split, hard cut, max limit
 - [x] `groups::GroupMap` — load from file, resolve known/unknown, missing file fallback, auto_slug, register, persist
+- [x] `groups::auto_group_slug` — Telegram strips negative, Slack lowercases
+- [x] `slack::parse_slack_ts` — normal, no decimal, empty, invalid

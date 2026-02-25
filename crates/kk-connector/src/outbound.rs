@@ -6,12 +6,12 @@ use tracing::{error, info, warn};
 use kk_core::nq;
 use kk_core::types::OutboundMessage;
 
-use crate::provider::telegram::TelegramProvider;
+use crate::provider::ProviderSender;
 
 pub async fn poll_outbound(
     outbox_dir: &str,
     channel_name: &str,
-    bot: &teloxide::Bot,
+    sender: &ProviderSender,
 ) -> Result<()> {
     let dir = Path::new(outbox_dir);
     let files = nq::list_pending(dir)?;
@@ -44,7 +44,7 @@ pub async fn poll_outbound(
             continue;
         }
 
-        match TelegramProvider::send(bot, &msg).await {
+        match sender.send(&msg).await {
             Ok(()) => {
                 info!(
                     group = msg.group,

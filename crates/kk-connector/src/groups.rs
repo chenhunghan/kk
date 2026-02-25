@@ -13,12 +13,13 @@ pub struct GroupMap {
     map: HashMap<String, String>,
 }
 
-/// Generate an auto-registration slug from a chat_id.
-/// Strips the leading `-` (Telegram supergroup IDs are negative) and prepends `tg-`.
-/// E.g. `-1001234567890` → `tg-1001234567890`.
-fn auto_group_slug(chat_id: &str) -> String {
+/// Generate an auto-registration slug from a chat_id and channel type prefix.
+/// Strips the leading `-` (Telegram supergroup IDs are negative) and lowercases.
+/// E.g. `tg`, `-1001234567890` → `tg-1001234567890`.
+/// E.g. `slack`, `C0123456789` → `slack-c0123456789`.
+fn auto_group_slug(chat_id: &str, prefix: &str) -> String {
     let stripped = chat_id.trim_start_matches('-');
-    format!("tg-{stripped}")
+    format!("{prefix}-{}", stripped.to_lowercase())
 }
 
 /// Load a GroupsConfig from a JSON file. Returns `Default` on any error.
@@ -62,12 +63,13 @@ impl GroupMap {
     }
 
     /// Register a new chat_id → auto-generated slug. Returns the slug.
+    /// `slug_prefix` is the channel type prefix (e.g. `"tg"`, `"slack"`).
     /// Does nothing if chat_id is already mapped.
-    pub fn register(&mut self, chat_id: &str, _channel_name: &str) -> String {
+    pub fn register(&mut self, chat_id: &str, slug_prefix: &str) -> String {
         if let Some(existing) = self.map.get(chat_id) {
             return existing.clone();
         }
-        let slug = auto_group_slug(chat_id);
+        let slug = auto_group_slug(chat_id, slug_prefix);
         self.map.insert(chat_id.to_string(), slug.clone());
         info!(chat_id, slug, "registered new group");
         slug
@@ -183,8 +185,13 @@ mod tests {
 
     #[test]
     fn auto_slug_strips_negative() {
-        assert_eq!(auto_group_slug("-1001234567890"), "tg-1001234567890");
-        assert_eq!(auto_group_slug("1001234567890"), "tg-1001234567890");
+        assert_eq!(auto_group_slug("-1001234567890", "tg"), "tg-1001234567890");
+        assert_eq!(auto_group_slug("1001234567890", "tg"), "tg-1001234567890");
+    }
+
+    #[test]
+    fn auto_slug_slack_lowercases() {
+        assert_eq!(auto_group_slug("C0123456789", "slack"), "slack-c0123456789");
     }
 
     #[test]
@@ -192,7 +199,7 @@ mod tests {
         let mut gm = GroupMap {
             map: HashMap::new(),
         };
-        let slug = gm.register("-1001234567890", "telegram-bot-1");
+        let slug = gm.register("-1001234567890", "tg");
         assert_eq!(slug, "tg-1001234567890");
         assert_eq!(
             gm.resolve("-1001234567890"),
@@ -206,7 +213,7 @@ mod tests {
         map.insert("-1001234567890".to_string(), "family-chat".to_string());
         let mut gm = GroupMap { map };
         // Should return existing slug, not overwrite
-        let slug = gm.register("-1001234567890", "telegram-bot-1");
+        let slug = gm.register("-1001234567890", "tg");
         assert_eq!(slug, "family-chat");
     }
 
@@ -218,7 +225,7 @@ mod tests {
         let mut gm = GroupMap {
             map: HashMap::new(),
         };
-        gm.register("-1001234567890", "test-channel");
+        gm.register("-1001234567890", "tg");
         gm.persist(groups_d_file.to_str().unwrap(), "test-channel")
             .unwrap();
 
