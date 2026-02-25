@@ -1,9 +1,10 @@
 //! Terminal connector: reads stdin, writes to inbound queue, prints responses from outbox/stream.
 
-use std::io::{BufRead, Write};
+use std::io::Write;
 use std::path::Path;
 
 use anyhow::Result;
+use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
 
 use kk_core::nq;
@@ -46,7 +47,7 @@ pub fn register_terminal_group(paths: &DataPaths) -> Result<()> {
     Ok(())
 }
 
-/// Run the terminal connector. This blocks the current thread on stdin.
+/// Run the terminal connector.
 /// Reads user input, enqueues to inbound, and polls outbox/stream for responses.
 pub async fn run(paths: DataPaths) -> Result<()> {
     // Ensure outbox/stream dirs exist
@@ -59,22 +60,36 @@ pub async fn run(paths: DataPaths) -> Result<()> {
         poll_outbound_loop(&poller_paths).await;
     });
 
-    // Read stdin in a blocking task
-    let stdin_paths = paths.clone();
-    let stdin_handle = tokio::task::spawn_blocking(move || {
-        read_stdin_loop(&stdin_paths);
+    // Read stdin on a dedicated OS thread to avoid runtime shutdown hangs.
+    let (line_tx, line_rx) = mpsc::unbounded_channel::<String>();
+    std::thread::spawn(move || {
+        read_stdin_loop(line_tx);
     });
 
+    // Consume stdin lines and enqueue inbound messages.
+    let stdin_paths = paths.clone();
+    let mut stdin_handle = tokio::spawn(async move {
+        process_stdin_lines(&stdin_paths, line_rx).await;
+    });
+
+    let mut outbound_handle = outbound_handle;
     tokio::select! {
-        _ = outbound_handle => {}
-        _ = stdin_handle => {}
+        _ = &mut outbound_handle => {}
+        _ = &mut stdin_handle => {}
     }
+
+    outbound_handle.abort();
+    stdin_handle.abort();
+    let _ = outbound_handle.await;
+    let _ = stdin_handle.await;
 
     Ok(())
 }
 
-/// Blocking loop: reads lines from stdin and enqueues them as inbound messages.
-fn read_stdin_loop(paths: &DataPaths) {
+/// Blocking loop: reads lines from stdin and sends them to async processing.
+fn read_stdin_loop(line_tx: mpsc::UnboundedSender<String>) {
+    use std::io::BufRead;
+
     let stdin = std::io::stdin();
     let mut stdout = std::io::stdout();
 
@@ -84,7 +99,10 @@ fn read_stdin_loop(paths: &DataPaths) {
     for line in stdin.lock().lines() {
         let text = match line {
             Ok(t) => t,
-            Err(_) => break, // EOF or error
+            Err(e) => {
+                eprintln!("[kk] failed to read stdin: {e}");
+                break;
+            }
         };
 
         let text = text.trim().to_string();
@@ -93,6 +111,15 @@ fn read_stdin_loop(paths: &DataPaths) {
             continue;
         }
 
+        if line_tx.send(text).is_err() {
+            break;
+        }
+    }
+}
+
+/// Async loop: receives stdin lines and enqueues them as inbound messages.
+async fn process_stdin_lines(paths: &DataPaths, mut line_rx: mpsc::UnboundedReceiver<String>) {
+    while let Some(text) = line_rx.recv().await {
         let now = std::time::SystemTime::now()
             .duration_since(std::time::UNIX_EPOCH)
             .unwrap()

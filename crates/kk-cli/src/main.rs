@@ -77,7 +77,7 @@ async fn main() -> Result<()> {
         paths.clone(),
     ));
 
-    // 9. Run terminal connector (foreground — blocks on stdin)
+    // 9. Run terminal connector in-process
     let terminal = tokio::spawn(terminal::run(paths));
 
     info!("kk is running — type a message or press Ctrl+C to stop");
@@ -120,6 +120,7 @@ fn spawn_connector(
     std::fs::create_dir_all(paths.stream_dir(&channel.name))?;
 
     let mut cmd = Command::new("kk-connector");
+    cmd.kill_on_drop(true);
     cmd.env("CHANNEL_TYPE", &channel.channel_type)
         .env("CHANNEL_NAME", &channel.name)
         .env("INBOUND_DIR", paths.inbound_dir())
