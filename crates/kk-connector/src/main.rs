@@ -7,7 +7,7 @@ use tracing::{error, info};
 use kk_connector::config::ConnectorConfig;
 use kk_connector::groups::GroupMap;
 use kk_connector::inbound::process_inbound;
-use kk_connector::outbound::poll_outbound;
+use kk_connector::outbound::{poll_outbound, poll_stream};
 use kk_connector::provider::ChatProvider;
 use kk_connector::provider::ConnectorEvent;
 use kk_connector::provider::slack::SlackProvider;
@@ -27,6 +27,7 @@ async fn main() -> Result<()> {
     // Ensure queue directories
     std::fs::create_dir_all(&config.inbound_dir)?;
     std::fs::create_dir_all(&config.outbox_dir)?;
+    std::fs::create_dir_all(&config.stream_dir)?;
 
     // Ensure groups.d parent directory exists
     if let Some(parent) = std::path::Path::new(&config.groups_d_file).parent() {
@@ -100,6 +101,9 @@ async fn main() -> Result<()> {
             .await
             {
                 error!(error = %e, "outbound poll error");
+            }
+            if let Err(e) = poll_stream(&outbound_config.stream_dir, &*sender).await {
+                error!(error = %e, "stream poll error");
             }
             sleep(interval).await;
         }

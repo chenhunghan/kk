@@ -9,6 +9,7 @@ pub struct ConnectorConfig {
     pub channel_name: String,
     pub inbound_dir: String,
     pub outbox_dir: String,
+    pub stream_dir: String,
     pub groups_d_file: String,
     pub telegram_bot_token: Option<String>,
     pub slack_bot_token: Option<String>,
@@ -36,6 +37,8 @@ impl ConnectorConfig {
             inbound_dir: env::var("INBOUND_DIR").unwrap_or_else(|_| "/data/inbound".into()),
             outbox_dir: env::var("OUTBOX_DIR")
                 .unwrap_or_else(|_| format!("/data/outbox/{channel_name}")),
+            stream_dir: env::var("STREAM_DIR")
+                .unwrap_or_else(|_| format!("/data/stream/{channel_name}")),
             groups_d_file: env::var("GROUPS_D_FILE")
                 .unwrap_or_else(|_| format!("/data/state/groups.d/{channel_name}.json")),
             telegram_bot_token: env::var("TELEGRAM_BOT_TOKEN").ok(),

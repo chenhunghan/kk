@@ -63,6 +63,7 @@ impl TestHarness {
             channel_name: TEST_CHANNEL.into(),
             inbound_dir: inbound_dir.to_str().unwrap().into(),
             outbox_dir: tmp.path().join("outbox").to_str().unwrap().into(),
+            stream_dir: tmp.path().join("stream").to_str().unwrap().into(),
             groups_d_file: groups_d_file.to_str().unwrap().into(),
             telegram_bot_token: None,
             slack_bot_token: None,

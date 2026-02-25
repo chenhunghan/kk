@@ -41,6 +41,16 @@ impl DataPaths {
         self.root.join("outbox").join(channel)
     }
 
+    /// /data/stream/{channel}/ — Gateway writes streaming updates, Connectors read
+    pub fn stream_dir(&self, channel: &str) -> PathBuf {
+        self.root.join("stream").join(channel)
+    }
+
+    /// /data/stream/{channel}/{session-id} — single overwritten stream file
+    pub fn stream_file(&self, channel: &str, session_id: &str) -> PathBuf {
+        self.stream_dir(channel).join(session_id)
+    }
+
     // --- Results ---
 
     /// /data/results/{session-id}/
@@ -148,6 +158,7 @@ impl DataPaths {
         let dirs = [
             self.root.join("inbound"),
             self.root.join("outbox"),
+            self.root.join("stream"),
             self.root.join("groups"),
             self.root.join("results"),
             self.results_done_dir(),
@@ -271,6 +282,14 @@ mod tests {
         assert_eq!(
             paths.result_status("family-chat-1234"),
             PathBuf::from("/data/results/family-chat-1234/status")
+        );
+        assert_eq!(
+            paths.stream_dir("telegram-bot-1"),
+            PathBuf::from("/data/stream/telegram-bot-1")
+        );
+        assert_eq!(
+            paths.stream_file("telegram-bot-1", "family-chat-1234"),
+            PathBuf::from("/data/stream/telegram-bot-1/family-chat-1234")
         );
     }
 

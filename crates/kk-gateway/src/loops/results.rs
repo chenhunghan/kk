@@ -96,20 +96,15 @@ pub async fn poll_once(state: &SharedState) -> Result<()> {
 
 /// Process a completed (done) Agent Job result.
 async fn process_done(state: &SharedState, session_id: &str) -> Result<()> {
-    // 1. Read request.json for routing info
     let manifest = read_manifest(state, session_id)?;
 
-    // 2. Extract response text from response.jsonl
     let response_path = state.paths.result_response(session_id);
     let text = extract_response_text(&response_path)?;
 
-    // 3. Build and write OutboundMessage
-    write_outbound(state, &manifest, &text)?;
+    // If streaming was active, write final to stream file; otherwise use outbox
+    write_final_or_outbox(state, session_id, &manifest, &text)?;
 
-    // 4. Archive results dir
     archive_results(state, session_id)?;
-
-    // 5. Remove from activeJobs + clean up stream offset
     remove_from_active(state, &manifest).await;
     state.stream_offsets.write().await.remove(session_id);
 
@@ -119,17 +114,12 @@ async fn process_done(state: &SharedState, session_id: &str) -> Result<()> {
 
 /// Process an error Agent Job result.
 async fn process_error(state: &SharedState, session_id: &str) -> Result<()> {
-    // 1. Read request.json for routing info
     let manifest = read_manifest(state, session_id)?;
 
-    // 2. Build error outbound message
     let text = format!("[kk] Agent job failed for session {session_id}. Check logs for details.");
-    write_outbound(state, &manifest, &text)?;
+    write_final_or_outbox(state, session_id, &manifest, &text)?;
 
-    // 3. Archive results dir
     archive_results(state, session_id)?;
-
-    // 4. Remove from activeJobs + clean up stream offset
     remove_from_active(state, &manifest).await;
     state.stream_offsets.write().await.remove(session_id);
 
@@ -154,7 +144,7 @@ async fn process_stopped(state: &SharedState, session_id: &str) -> Result<()> {
         format!("{partial_text}\n\n[kk] (stopped by user)")
     };
 
-    write_outbound(state, &manifest, &text)?;
+    write_final_or_outbox(state, session_id, &manifest, &text)?;
     archive_results(state, session_id)?;
     remove_from_active(state, &manifest).await;
     state.stream_offsets.write().await.remove(session_id);
@@ -182,7 +172,7 @@ async fn process_overflow(state: &SharedState, session_id: &str) -> Result<()> {
         )
     };
 
-    write_outbound(state, &manifest, &text)?;
+    write_final_or_outbox(state, session_id, &manifest, &text)?;
 
     // Clear persisted claude session_id so next Job starts fresh
     let sid_path = state
@@ -258,23 +248,17 @@ async fn try_stream_partial(state: &SharedState, session_id: &str) -> Result<()>
         .await
         .insert(session_id.to_string(), file_len);
 
-    // Send intermediate message if we found new text
+    // Write stream file if we found new text
     if let Some(text) = latest_text {
         let manifest = match read_manifest(state, session_id) {
             Ok(m) => m,
             Err(_) => return Ok(()),
         };
 
-        // Flatten manifest meta into top level so providers can read chat_id/channel_id directly,
-        // then add streaming + session_id fields.
         let meta = {
             let mut m = manifest.meta.clone();
             if let Some(obj) = m.as_object_mut() {
-                obj.insert("streaming".into(), serde_json::Value::Bool(true));
-                obj.insert(
-                    "session_id".into(),
-                    serde_json::Value::String(session_id.to_string()),
-                );
+                obj.insert("final".into(), serde_json::Value::Bool(false));
             }
             m
         };
@@ -287,15 +271,10 @@ async fn try_stream_partial(state: &SharedState, session_id: &str) -> Result<()>
             meta,
         };
 
-        let outbox_dir = state.paths.outbox_dir(&manifest.channel);
-        let payload = serde_json::to_vec(&outbound)?;
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-        nq::enqueue(&outbox_dir, now, &payload)?;
+        let stream_path = state.paths.stream_file(&manifest.channel, session_id);
+        write_stream_file(&stream_path, &outbound)?;
 
-        debug!(session_id, "sent streaming partial response");
+        debug!(session_id, "wrote streaming partial to stream file");
     }
 
     Ok(())
@@ -361,6 +340,50 @@ fn write_outbound(state: &SharedState, manifest: &RequestManifest, text: &str) -
         .unwrap()
         .as_secs();
     nq::enqueue(&outbox_dir, now, &payload)?;
+    Ok(())
+}
+
+/// If streaming was active (stream file exists), write final content there.
+/// Otherwise fall back to outbox for a regular new message.
+fn write_final_or_outbox(
+    state: &SharedState,
+    session_id: &str,
+    manifest: &RequestManifest,
+    text: &str,
+) -> Result<()> {
+    let stream_path = state.paths.stream_file(&manifest.channel, session_id);
+    if stream_path.exists() {
+        // Streaming was active — write final to stream path
+        let meta = {
+            let mut m = manifest.meta.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("final".into(), serde_json::Value::Bool(true));
+            }
+            m
+        };
+        let outbound = OutboundMessage {
+            channel: manifest.channel.clone(),
+            group: manifest.group.clone(),
+            thread_id: manifest.thread_id.clone(),
+            text: text.to_string(),
+            meta,
+        };
+        write_stream_file(&stream_path, &outbound)
+    } else {
+        // No streaming happened — write to outbox as regular message
+        write_outbound(state, manifest, text)
+    }
+}
+
+/// Atomically write a stream file (write to .tmp, then rename).
+fn write_stream_file(stream_path: &Path, outbound: &OutboundMessage) -> Result<()> {
+    if let Some(parent) = stream_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    let tmp = stream_path.with_extension("tmp");
+    let payload = serde_json::to_vec(outbound)?;
+    std::fs::write(&tmp, &payload)?;
+    std::fs::rename(&tmp, stream_path)?;
     Ok(())
 }
 
