@@ -347,13 +347,10 @@ pub fn archive_orphaned_sessions(paths: &DataPaths) {
             continue;
         }
 
-        // Leave running sessions alone.
-        let status = std::fs::read_to_string(paths.result_status(&dir_name)).unwrap_or_default();
-        if status.trim() == "running" {
-            continue;
-        }
-
         // Only archive sessions that belong to this terminal channel.
+        // Note: we archive regardless of status=running — when kk-cli is
+        // killed, child kk-agent processes die with it, so all terminal
+        // sessions from a previous run are always orphaned.
         let manifest_path = paths.request_manifest(&dir_name);
         let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
             continue;
