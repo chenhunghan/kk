@@ -1,11 +1,11 @@
-# KubeClaw: Plan — Controller
+# kk: Controller
 
 > **Cross-references:**
-> [Communication Protocol](protocol.md) ·
-> [Plan: Connector](plan-connector.md) ·
-> [Plan: Gateway](plan-gateway.md) ·
-> [Plan: Agent Job](plan-agent-job.md) ·
-> [Plan: Skill](plan-skill.md)
+> [Communication Protocol](kk-protocol.md) ·
+> [Connector](kk-connector.md) ·
+> [Gateway](kubeclaw-plan-gateway.md) ·
+> [Agent Job](kubeclaw-plan-agent-job.md) ·
+> [Skill](kubeclaw-plan-skill.md)
 
 ---
 
@@ -25,7 +25,7 @@ The Controller has **no knowledge** of the Gateway, Agent Jobs, messages, or que
 ## Image
 
 ```
-kubeclaw-controller:latest
+kk-controller:latest
 
 Base:   alpine:3.19 (or debian-slim)
 Install: git, ca-certificates
@@ -41,7 +41,7 @@ Size:    ~50MB
 
 | Var | Default | Description |
 |---|---|---|
-| `IMAGE_CONNECTOR` | `kubeclaw-connector:latest` | Image used for Connector Deployments |
+| `IMAGE_CONNECTOR` | `kk-connector:latest` | Image used for Connector Deployments |
 | `DATA_DIR` | `/data` | PVC mount path |
 | `NAMESPACE` | Auto-detected (in-cluster) | Namespace to watch. Falls back to reading `/var/run/secrets/.../namespace` |
 | `RECONCILE_WORKERS` | `2` | Number of concurrent reconcile workers per CRD type |
@@ -55,14 +55,14 @@ Size:    ~50MB
 1. Read env vars, validate required ones
 2. Build K8s client (in-cluster config via ServiceAccount token)
 3. Verify CRDs exist:
-   GET /apis/kubeclaw.io/v1alpha1 → must list "channels" and "skills"
+   GET /apis/kk.io/v1alpha1 → must list "channels" and "skills"
    If missing → log FATAL "CRDs not installed. Apply CRDs before starting controller." → exit 1
 4. Ensure PVC directories exist:
    mkdir -p $DATA_DIR/skills
 5. Start shared informer factory with two informers:
-   a. Informer: channels.kubeclaw.io/v1alpha1
+   a. Informer: channels.kk.io/v1alpha1
       → onAdd/onUpdate/onDelete → enqueue to channelWorkQueue
-   b. Informer: skills.kubeclaw.io/v1alpha1
+   b. Informer: skills.kk.io/v1alpha1
       → onAdd/onUpdate/onDelete → enqueue to skillWorkQueue
 6. Wait for informer caches to sync (with 30s timeout)
 7. Start worker goroutines:
@@ -119,11 +119,11 @@ channelReconcile(key):
       name:       "connector-" + channel.metadata.name
       namespace:  channel.metadata.namespace
       labels:
-        app:           "kubeclaw-connector"
+        app:           "kk-connector"
         channel:       channel.metadata.name
         channel-type:  channel.spec.type
       ownerReferences:
-        - apiVersion:          "kubeclaw.io/v1alpha1"
+        - apiVersion:          "kk.io/v1alpha1"
           kind:                "Channel"
           name:                channel.metadata.name
           uid:                 channel.metadata.uid
@@ -134,12 +134,12 @@ channelReconcile(key):
       replicas: 1
       selector:
         matchLabels:
-          app:      "kubeclaw-connector"
+          app:      "kk-connector"
           channel:  channel.metadata.name
       template:
         metadata:
           labels:
-            app:           "kubeclaw-connector"
+            app:           "kk-connector"
             channel:       channel.metadata.name
             channel-type:  channel.spec.type
         spec:
@@ -164,7 +164,7 @@ channelReconcile(key):
           volumes:
           - name: data
             persistentVolumeClaim:
-              claimName: kubeclaw-data
+              claimName: kk-data
   }
 
   # Merge channel.spec.config into connector env if present
@@ -434,22 +434,22 @@ Skills do NOT requeue on failure because the recovery path is always delete + re
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: kubeclaw-controller
-  namespace: kubeclaw
+  name: kk-controller
+  namespace: kk
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
 metadata:
-  name: kubeclaw-controller
-  namespace: kubeclaw
+  name: kk-controller
+  namespace: kk
 rules:
 # Watch and update Channel CRs
-- apiGroups: ["kubeclaw.io"]
+- apiGroups: ["kk.io"]
   resources: ["channels", "channels/status"]
   verbs: ["get", "list", "watch", "update", "patch"]
 
 # Watch and update Skill CRs
-- apiGroups: ["kubeclaw.io"]
+- apiGroups: ["kk.io"]
   resources: ["skills", "skills/status"]
   verbs: ["get", "list", "watch", "update", "patch"]
 
@@ -476,14 +476,14 @@ rules:
 apiVersion: rbac.authorization.k8s.io/v1
 kind: RoleBinding
 metadata:
-  name: kubeclaw-controller
-  namespace: kubeclaw
+  name: kk-controller
+  namespace: kk
 subjects:
 - kind: ServiceAccount
-  name: kubeclaw-controller
+  name: kk-controller
 roleRef:
   kind: Role
-  name: kubeclaw-controller
+  name: kk-controller
   apiGroup: rbac.authorization.k8s.io
 ```
 
@@ -495,27 +495,27 @@ roleRef:
 apiVersion: apps/v1
 kind: Deployment
 metadata:
-  name: kubeclaw-controller
-  namespace: kubeclaw
+  name: kk-controller
+  namespace: kk
   labels:
-    app: kubeclaw-controller
+    app: kk-controller
 spec:
   replicas: 1                           # single replica — leader election not needed
   selector:
     matchLabels:
-      app: kubeclaw-controller
+      app: kk-controller
   template:
     metadata:
       labels:
-        app: kubeclaw-controller
+        app: kk-controller
     spec:
-      serviceAccountName: kubeclaw-controller
+      serviceAccountName: kk-controller
       containers:
       - name: controller
-        image: kubeclaw-controller:latest
+        image: kk-controller:latest
         env:
         - name: IMAGE_CONNECTOR
-          value: kubeclaw-connector:latest
+          value: kk-connector:latest
         - name: DATA_DIR
           value: /data
         - name: SKILL_CLONE_TIMEOUT
@@ -547,7 +547,7 @@ spec:
       volumes:
       - name: data
         persistentVolumeClaim:
-          claimName: kubeclaw-data
+          claimName: kk-data
 ```
 
 ---
@@ -569,7 +569,7 @@ Structured JSON logs (for easy parsing by log aggregators):
 
 ```jsonc
 // Startup
-{"level":"info","msg":"Starting controller","version":"v0.1.0","namespace":"kubeclaw"}
+{"level":"info","msg":"Starting controller","version":"v0.1.0","namespace":"kk"}
 {"level":"info","msg":"CRDs verified","channels":true,"skills":true}
 {"level":"info","msg":"Informer caches synced","duration_ms":1200}
 

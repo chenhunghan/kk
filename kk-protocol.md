@@ -1,19 +1,19 @@
-# KubeClaw: Communication Protocol
+# kk: Communication Protocol
 
 > **Cross-references:**
-> [Plan: Controller](plan-controller.md) ·
-> [Plan: Connector](plan-connector.md) ·
-> [Plan: Gateway](plan-gateway.md) ·
-> [Plan: Agent Job](plan-agent-job.md) ·
-> [Plan: Skill](plan-skill.md)
+> [Controller](kk-controller.md) ·
+> [Connector](kk-connector.md) ·
+> [Gateway](kubeclaw-plan-gateway.md) ·
+> [Agent Job](kubeclaw-plan-agent-job.md) ·
+> [Skill](kubeclaw-plan-skill.md)
 
-This document is the single source of truth for how all KubeClaw components communicate. Every file path, message format, polling interval, and nq convention is defined here. Component plans reference this document — they do not redefine protocol details.
+This document is the single source of truth for how all kk components communicate. Every file path, message format, polling interval, and nq convention is defined here. Component plans reference this document — they do not redefine protocol details.
 
 ---
 
 ## 1. Communication Medium
 
-All inter-component communication happens via **files on a single shared RWX PVC** (`kubeclaw-data`), mounted at `/data` in every pod.
+All inter-component communication happens via **files on a single shared RWX PVC** (`kk-data`), mounted at `/data` in every pod.
 
 There are **no network calls** between components (no HTTP, no gRPC, no TCP sockets). The only network calls are:
 - Connectors ↔ external providers (Telegram API, WhatsApp WebSocket, etc.)
@@ -25,7 +25,7 @@ There are **no network calls** between components (no HTTP, no gRPC, no TCP sock
 
 ## 1.1 Key Concepts
 
-**Group** — A group represents a single conversation context, mapped 1:1 to a provider chat (e.g. a Telegram group chat or DM). It is the unit of isolation in kk: each group gets its own agent job, its own follow-up queue (`/data/groups/{group}/`), and its own persistent session state (`/data/sessions/{group}/`). Messages from different groups never mix. A group is identified by its **slug** — a lowercase, hyphen-separated string matching `[a-z0-9-]+` (e.g. `family-chat`, `work-team`). The slug is mapped from the provider's numeric chat ID via `groups.json`. Messages from unmapped chat IDs are dropped with a warning. Throughout code and docs, the field `group` always holds this slug, never a display name or provider ID.
+**Group** — A group represents a single conversation context, mapped 1:1 to a provider chat (e.g. a Telegram group chat or DM). It is the unit of isolation in kk: each group gets its own agent job, its own follow-up queue (`/data/groups/{group}/`), and its own persistent session state (`/data/sessions/{group}/`). Messages from different groups never mix. A group is identified by its **slug** — a lowercase, hyphen-separated string matching `[a-z0-9-]+` (e.g. `family-chat`, `work-team`). The slug is mapped from the provider's chat ID via `groups.d/{channel}.json`. Unmapped chat IDs are auto-registered by the Connector (see §6). Throughout code and docs, the field `group` always holds this slug, never a display name or provider ID.
 
 **Thread** — A thread represents a sub-conversation within a group (e.g. a Telegram Forum Topic, Slack thread, or Discord thread). The routing key is `(group, thread_id)` — each pair gets its own agent job, follow-up queue, and session state. `thread_id` is `Option<String>` (`None` for non-threaded chats, string for threaded — Telegram uses integers-as-strings like `"42"`, Slack uses timestamps like `"1708801285.000050"`). Trigger config is per-group; all threads in a group share the same trigger pattern.
 
@@ -35,7 +35,7 @@ There are **no network calls** between components (no HTTP, no gRPC, no TCP sock
 
 ## 2. nq Queue Convention
 
-KubeClaw uses the [nq](https://github.com/leahneukirchen/nq) file-based job queue pattern. Each queue is a directory. Each message is a file in that directory.
+kk uses the [nq](https://github.com/leahneukirchen/nq) file-based job queue pattern. Each queue is a directory. Each message is a file in that directory.
 
 ### File Naming
 
@@ -94,7 +94,9 @@ No separate done marker. Successful processing = file deleted. If a file persist
 ├── sessions/{group}/      R+W:   Agent Jobs    (claude state)
 │   └── threads/{thread-id}/    R+W:   Agent Jobs    (threaded sessions)
 ├── memory/                     R+W:   Human/Admin   READ: Agent Jobs
-└── state/                      R+W:   Gateway
+└── state/
+    ├── groups.d/               WRITE: Connectors    READ: Gateway
+    └── cursors.json            R+W:   Gateway
 ```
 
 ### Ownership Rules
@@ -108,7 +110,8 @@ No separate done marker. Successful processing = file deleted. If a file persist
 | `/data/skills/{skill}/` | Controller | Agent Jobs (via symlink) | Controller (on Skill CR delete) |
 | `/data/sessions/{group}/` | Agent Jobs | Agent Jobs | Never auto-cleaned (persistent state) |
 | `/data/memory/` | Human (kubectl/editor) | Agent Jobs | Never auto-cleaned |
-| `/data/state/` | Gateway | Gateway | Gateway (overwrites in place) |
+| `/data/state/groups.d/` | Connectors (own file) | Gateway | Connectors (overwrite on register) |
+| `/data/state/cursors.json` | Gateway | Gateway | Gateway (overwrites in place) |
 
 ---
 
@@ -329,9 +332,8 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 
 ```
 /data/state/
-├── groups.json                 ← group registry, admin-managed (see §6)
-├── groups.d/                   ← auto-registered groups (see §6)
-│   ├── telegram-bot-1.json     ← per-channel auto-registrations
+├── groups.d/                   ← per-channel group registrations (see §6)
+│   ├── telegram-bot-1.json     ← auto-registered by Connector
 │   └── ...
 └── cursors.json                ← processing cursors (see §7)
 ```
@@ -340,37 +342,29 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 
 ## 6. Group Registry
 
-**File:** `/data/state/groups.json`
-**Owner:** Gateway (read + write)
-**Also read by:** Connectors (for chat_id → group slug mapping, read-only)
+**Directory:** `/data/state/groups.d/`
+**Written by:** Connectors (one file per channel)
+**Read by:** Gateway (merges all files), Connectors (own file only)
+
+Each Connector writes its own `groups.d/{channel-name}.json` file. The Gateway merges all `groups.d/*.json` files to build the full group registry.
 
 ```jsonc
+// /data/state/groups.d/telegram-bot-1.json
 {
   "groups": {
-    "family-chat": {
-      "trigger_pattern": "@Andy",       // regex or simple string match
+    "tg-1001234567890": {
       "trigger_mode": "mention",        // "mention" | "always" | "prefix"
-      "channels": {                     // which channels map to this group
+      "channels": {
         "telegram-bot-1": {
           "chat_id": "-1001234567890"   // provider-specific group ID
         }
       }
     },
-    "work-team": {
-      "trigger_pattern": "@Andy",
+    "tg-1009876543210": {
       "trigger_mode": "mention",
       "channels": {
-        "slack-eng": {
-          "chat_id": "C0123456789"
-        }
-      }
-    },
-    "main": {
-      "trigger_pattern": null,          // null = always trigger
-      "trigger_mode": "always",
-      "channels": {
-        "whatsapp-main": {
-          "chat_id": "1234567890@s.whatsapp.net"
+        "telegram-bot-1": {
+          "chat_id": "-1009876543210"
         }
       }
     }
@@ -378,17 +372,15 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 }
 ```
 
-### Auto-Registration via groups.d/
+### Auto-Registration
 
-Connectors auto-register unknown chats by writing to `/data/state/groups.d/{channel-name}.json`. Each Connector instance writes only its own file, avoiding concurrent writer conflicts.
+Connectors auto-register unknown chats by writing to their `groups.d/{channel-name}.json`. Each Connector instance writes only its own file, avoiding concurrent writer conflicts.
 
-**Auto-generated slug format:** `tg-{abs(chat_id)}` — strips leading `-` from Telegram supergroup IDs. E.g. `-1001234567890` → `tg-1001234567890`. Default trigger mode: `mention`.
+**Auto-generated slug format:** `tg-{abs(chat_id)}` — strips leading `-` from negative chat IDs. E.g. `-1001234567890` → `tg-1001234567890`. Default trigger mode: `mention`.
 
-**How Connectors use it:** On startup, the Connector loads its `groups.d/{channel}.json` to build a reverse lookup map: `chat_id → group slug`. When a message arrives from an unmapped chat_id, the Connector auto-registers it (writes to `groups.d/`) and processes the message. The config is reloaded every 30s.
+**How Connectors use it:** On startup, the Connector loads its `groups.d/{channel}.json` to build a reverse lookup map: `chat_id → group slug`. When a message arrives from an unmapped chat_id, the Connector auto-registers it (writes to `groups.d/` and updates the in-memory map) and processes the message immediately.
 
-**How Gateway uses it:** The Gateway merges all `groups.d/*.json` files with its own `groups.json` to discover both auto-registered and admin-configured groups. See the Gateway plan for merge details.
-
-**How Gateway uses it:** When processing an inbound message, the Gateway reads the `trigger_pattern` and `trigger_mode` for the message's `group` to decide whether to act on it.
+**How Gateway uses it:** The Gateway merges all `groups.d/*.json` files to discover all registered groups. When processing an inbound message, the Gateway reads the `trigger_pattern` and `trigger_mode` for the message's `group` to decide whether to act on it.
 
 ### Trigger Modes
 
@@ -506,7 +498,7 @@ Arrows show data flow direction:
 | No partial reads | Atomic rename pattern (write to `.tmp-*`, rename to `,*.nq`) |
 | One reader per queue | Each queue has exactly one reader (Gateway for inbound, Connector for its outbox, Agent for its group queue) |
 | No concurrent results writes | Each session-id is unique, only one Job writes to its results dir |
-| groups.json consistency | Only Gateway writes; single-replica Deployment, single-threaded |
+| groups.d/ consistency | Each Connector writes only its own `groups.d/{channel}.json` — no concurrent writers per file |
 
 The only potential race is if Gateway creates a Job at the exact moment a previous Job for the same group is finishing. This is handled by the Gateway checking Job status (via K8s API) before creating a new one.
 
