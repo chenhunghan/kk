@@ -120,24 +120,39 @@ pub async fn poll_stream(stream_dir: &str, sender: &dyn ChatProvider) -> Result<
         let session_id = &name;
         let state_path = stream_state_path(dir, session_id);
 
+        let native = sender.supports_native_stream();
+
         let result = if state_path.exists() {
-            // We've already sent the initial message — edit it
+            // We've already sent the initial message — update it
             let platform_msg_id = std::fs::read_to_string(&state_path)?;
             let platform_msg_id = platform_msg_id.trim();
-            let edit_result = sender.edit(&msg, platform_msg_id).await;
+            let update_result = if native {
+                if is_final {
+                    sender.stream_stop(&msg, platform_msg_id).await
+                } else {
+                    sender.stream_append(&msg, platform_msg_id).await
+                }
+            } else {
+                sender.edit(&msg, platform_msg_id).await
+            };
             if is_final {
                 let _ = std::fs::remove_file(&state_path);
                 let _ = std::fs::remove_file(entry.path());
             }
-            edit_result
+            update_result
         } else if is_final {
             // Final without prior streaming — send as new message, then cleanup
             let result = sender.send(&msg).await;
             let _ = std::fs::remove_file(entry.path());
             result
         } else {
-            // First streaming message — send new, capture platform message ID
-            match sender.send_returning_id(&msg).await {
+            // First streaming message — start stream or send new
+            let start_result = if native {
+                sender.stream_start(&msg).await
+            } else {
+                sender.send_returning_id(&msg).await
+            };
+            match start_result {
                 Ok(msg_id) => {
                     std::fs::write(&state_path, &msg_id)?;
                     Ok(())
@@ -456,5 +471,233 @@ mod tests {
             !stream_dir.join("sess-bad").exists(),
             "malformed stream file should be removed"
         );
+    }
+
+    // --- Native streaming tests ---
+
+    /// Recorded call from NativeStreamMock.
+    #[derive(Debug, Clone)]
+    enum NativeCall {
+        Send {
+            text: String,
+        },
+        StreamStart {
+            text: String,
+        },
+        StreamAppend {
+            text: String,
+            platform_msg_id: String,
+        },
+        StreamStop {
+            text: String,
+            platform_msg_id: String,
+        },
+    }
+
+    /// A ChatProvider that supports native streaming and records all calls.
+    struct NativeStreamMock {
+        calls: Arc<Mutex<Vec<NativeCall>>>,
+        mock_msg_id: String,
+    }
+
+    impl NativeStreamMock {
+        fn new(mock_msg_id: &str) -> Self {
+            Self {
+                calls: Arc::new(Mutex::new(Vec::new())),
+                mock_msg_id: mock_msg_id.to_string(),
+            }
+        }
+
+        fn calls(&self) -> Vec<NativeCall> {
+            self.calls.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl ChatProvider for NativeStreamMock {
+        async fn send(&self, msg: &OutboundMessage) -> Result<()> {
+            self.calls.lock().unwrap().push(NativeCall::Send {
+                text: msg.text.clone(),
+            });
+            Ok(())
+        }
+
+        async fn send_returning_id(&self, _msg: &OutboundMessage) -> Result<String> {
+            panic!("send_returning_id should not be called for native streaming provider");
+        }
+
+        async fn edit(&self, _msg: &OutboundMessage, _platform_msg_id: &str) -> Result<()> {
+            panic!("edit should not be called for native streaming provider");
+        }
+
+        fn supports_native_stream(&self) -> bool {
+            true
+        }
+
+        async fn stream_start(&self, msg: &OutboundMessage) -> Result<String> {
+            self.calls.lock().unwrap().push(NativeCall::StreamStart {
+                text: msg.text.clone(),
+            });
+            Ok(self.mock_msg_id.clone())
+        }
+
+        async fn stream_append(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(NativeCall::StreamAppend {
+                text: msg.text.clone(),
+                platform_msg_id: platform_msg_id.to_string(),
+            });
+            Ok(())
+        }
+
+        async fn stream_stop(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> {
+            self.calls.lock().unwrap().push(NativeCall::StreamStop {
+                text: msg.text.clone(),
+                platform_msg_id: platform_msg_id.to_string(),
+            });
+            Ok(())
+        }
+    }
+
+    /// Native: first stream file → stream_start called, state file created.
+    #[tokio::test]
+    async fn native_stream_start() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream_dir = tmp.path();
+
+        write_stream_file(stream_dir, "ns-001", "thinking...", false);
+
+        let mock = NativeStreamMock::new("slack-ts-42");
+        poll_stream(stream_dir.to_str().unwrap(), &mock)
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0], NativeCall::StreamStart { text } if text == "thinking..."));
+
+        let state = std::fs::read_to_string(stream_dir.join(".stream-ns-001")).unwrap();
+        assert_eq!(state, "slack-ts-42");
+        assert!(stream_dir.join("ns-001").exists());
+    }
+
+    /// Native: subsequent stream file → stream_append called.
+    #[tokio::test]
+    async fn native_stream_append() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream_dir = tmp.path();
+
+        write_stream_file(stream_dir, "ns-002", "more text...", false);
+        std::fs::write(stream_dir.join(".stream-ns-002"), "slack-ts-99").unwrap();
+
+        let mock = NativeStreamMock::new("unused");
+        poll_stream(stream_dir.to_str().unwrap(), &mock)
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            &calls[0],
+            NativeCall::StreamAppend { text, platform_msg_id }
+            if text == "more text..." && platform_msg_id == "slack-ts-99"
+        ));
+
+        assert!(stream_dir.join("ns-002").exists());
+        assert!(stream_dir.join(".stream-ns-002").exists());
+    }
+
+    /// Native: final stream file → stream_stop called, both files cleaned up.
+    #[tokio::test]
+    async fn native_stream_stop_and_cleanup() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream_dir = tmp.path();
+
+        write_stream_file(stream_dir, "ns-003", "The final answer.", true);
+        std::fs::write(stream_dir.join(".stream-ns-003"), "slack-ts-77").unwrap();
+
+        let mock = NativeStreamMock::new("unused");
+        poll_stream(stream_dir.to_str().unwrap(), &mock)
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(
+            &calls[0],
+            NativeCall::StreamStop { text, platform_msg_id }
+            if text == "The final answer." && platform_msg_id == "slack-ts-77"
+        ));
+
+        assert!(!stream_dir.join("ns-003").exists());
+        assert!(!stream_dir.join(".stream-ns-003").exists());
+    }
+
+    /// Native: final without prior streaming → send (not stream_start), file deleted.
+    #[tokio::test]
+    async fn native_stream_final_without_prior_sends_new() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream_dir = tmp.path();
+
+        write_stream_file(stream_dir, "ns-004", "instant response", true);
+
+        let mock = NativeStreamMock::new("unused");
+        poll_stream(stream_dir.to_str().unwrap(), &mock)
+            .await
+            .unwrap();
+
+        let calls = mock.calls();
+        assert_eq!(calls.len(), 1);
+        assert!(matches!(&calls[0], NativeCall::Send { text } if text == "instant response"));
+        assert!(!stream_dir.join("ns-004").exists());
+    }
+
+    /// Native: full lifecycle: stream_start → stream_append → stream_stop + cleanup.
+    #[tokio::test]
+    async fn native_stream_full_lifecycle() {
+        let tmp = tempfile::tempdir().unwrap();
+        let stream_dir = tmp.path();
+        let dir_str = stream_dir.to_str().unwrap();
+
+        let mock = NativeStreamMock::new("slack-ts-55");
+
+        // Step 1: Start stream
+        write_stream_file(stream_dir, "ns-lifecycle", "thinking...", false);
+        poll_stream(dir_str, &mock).await.unwrap();
+
+        assert_eq!(mock.calls().len(), 1);
+        assert!(
+            matches!(&mock.calls()[0], NativeCall::StreamStart { text } if text == "thinking...")
+        );
+        assert!(stream_dir.join(".stream-ns-lifecycle").exists());
+
+        // Step 2: Append
+        write_stream_file(stream_dir, "ns-lifecycle", "Here's what I found...", false);
+        poll_stream(dir_str, &mock).await.unwrap();
+
+        assert_eq!(mock.calls().len(), 2);
+        assert!(matches!(
+            &mock.calls()[1],
+            NativeCall::StreamAppend { text, platform_msg_id }
+            if text == "Here's what I found..." && platform_msg_id == "slack-ts-55"
+        ));
+
+        // Step 3: Stop
+        write_stream_file(
+            stream_dir,
+            "ns-lifecycle",
+            "The complete answer is 42.",
+            true,
+        );
+        poll_stream(dir_str, &mock).await.unwrap();
+
+        assert_eq!(mock.calls().len(), 3);
+        assert!(matches!(
+            &mock.calls()[2],
+            NativeCall::StreamStop { text, platform_msg_id }
+            if text == "The complete answer is 42." && platform_msg_id == "slack-ts-55"
+        ));
+
+        assert!(!stream_dir.join("ns-lifecycle").exists());
+        assert!(!stream_dir.join(".stream-ns-lifecycle").exists());
     }
 }

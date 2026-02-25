@@ -149,6 +149,124 @@ impl ChatProvider for SlackOutbound {
 
         Ok(())
     }
+
+    fn supports_native_stream(&self) -> bool {
+        true
+    }
+
+    async fn stream_start(&self, msg: &OutboundMessage) -> Result<String> {
+        let channel_id = extract_channel_id(msg)?;
+        let user_id = msg
+            .meta
+            .get("user_id")
+            .and_then(|v| v.as_str())
+            .context("outbound message missing meta.user_id for stream_start")?;
+        let team_id = msg
+            .meta
+            .get("team_id")
+            .and_then(|v| v.as_str())
+            .context("outbound message missing meta.team_id for stream_start")?;
+
+        let text = truncate_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
+        let mut body = serde_json::json!({
+            "channel": channel_id,
+            "text": text,
+            "recipient_user_id": user_id,
+            "recipient_team_id": team_id,
+        });
+
+        if let Some(ref thread_ts) = msg.thread_id {
+            body["thread_ts"] = serde_json::Value::String(thread_ts.clone());
+        } else if let Some(reply_ts) = msg.meta.get("reply_to_ts").and_then(|v| v.as_str()) {
+            body["thread_ts"] = serde_json::Value::String(reply_ts.to_string());
+        }
+
+        let resp: serde_json::Value = self
+            .client
+            .post("https://slack.com/api/chat.startStream")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| format!("failed to start slack stream in channel {channel_id}"))?
+            .json()
+            .await
+            .context("failed to parse chat.startStream response")?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let error = resp["error"].as_str().unwrap_or("unknown");
+            bail!("chat.startStream failed for channel {channel_id}: {error}");
+        }
+
+        let ts = resp["ts"]
+            .as_str()
+            .context("missing ts in chat.startStream response")?;
+        Ok(ts.to_string())
+    }
+
+    async fn stream_append(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> {
+        let channel_id = extract_channel_id(msg)?;
+
+        let text = truncate_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "ts": platform_msg_id,
+            "text": text,
+        });
+
+        let resp: serde_json::Value = self
+            .client
+            .post("https://slack.com/api/chat.appendStream")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| {
+                format!("failed to append slack stream {platform_msg_id} in channel {channel_id}")
+            })?
+            .json()
+            .await
+            .context("failed to parse chat.appendStream response")?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let error = resp["error"].as_str().unwrap_or("unknown");
+            bail!("chat.appendStream failed for channel {channel_id}: {error}");
+        }
+
+        Ok(())
+    }
+
+    async fn stream_stop(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()> {
+        let channel_id = extract_channel_id(msg)?;
+
+        let text = truncate_text(&msg.text, SLACK_MAX_MESSAGE_LEN);
+        let body = serde_json::json!({
+            "channel": channel_id,
+            "ts": platform_msg_id,
+            "text": text,
+        });
+
+        let resp: serde_json::Value = self
+            .client
+            .post("https://slack.com/api/chat.stopStream")
+            .bearer_auth(&self.bot_token)
+            .json(&body)
+            .send()
+            .await
+            .with_context(|| {
+                format!("failed to stop slack stream {platform_msg_id} in channel {channel_id}")
+            })?
+            .json()
+            .await
+            .context("failed to parse chat.stopStream response")?;
+
+        if !resp["ok"].as_bool().unwrap_or(false) {
+            let error = resp["error"].as_str().unwrap_or("unknown");
+            bail!("chat.stopStream failed for channel {channel_id}: {error}");
+        }
+
+        Ok(())
+    }
 }
 
 pub struct SlackProvider {
@@ -368,6 +486,7 @@ impl SlackProvider {
                         "channel_id": channel_id,
                         "message_ts": ts,
                         "user_id": user,
+                        "team_id": event["team"].as_str().unwrap_or_default(),
                     }),
                 };
 

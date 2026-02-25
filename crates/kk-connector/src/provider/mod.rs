@@ -34,6 +34,11 @@ pub enum ConnectorEvent {
 /// Implementing `send()` + `edit()` gives fallback (edit-in-place) streaming for free.
 /// The outbound loop in `outbound.rs` handles the streaming coordination using these
 /// three methods — no provider needs to know about streaming state files.
+///
+/// Providers that support native streaming (e.g. Slack `chat.startStream`/`appendStream`/
+/// `stopStream`) can override the `supports_native_stream` and `stream_*` methods.
+/// When `supports_native_stream()` returns true, `poll_stream()` uses those methods
+/// instead of the `send_returning_id`/`edit` fallback.
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
     /// Send a new message. May split long messages across multiple platform messages.
@@ -46,4 +51,25 @@ pub trait ChatProvider: Send + Sync {
     /// Edit a previously sent message by its platform-specific ID.
     /// Used for streaming: updates the same message with new partial content.
     async fn edit(&self, msg: &OutboundMessage, platform_msg_id: &str) -> Result<()>;
+
+    /// Whether this provider supports native streaming (e.g. Slack).
+    /// Default: false — use edit-in-place fallback.
+    fn supports_native_stream(&self) -> bool {
+        false
+    }
+
+    /// Start a native streaming session. Returns platform message ID.
+    async fn stream_start(&self, _msg: &OutboundMessage) -> Result<String> {
+        anyhow::bail!("native streaming not supported")
+    }
+
+    /// Append text to an active native stream.
+    async fn stream_append(&self, _msg: &OutboundMessage, _platform_msg_id: &str) -> Result<()> {
+        anyhow::bail!("native streaming not supported")
+    }
+
+    /// Finalize an active native stream.
+    async fn stream_stop(&self, _msg: &OutboundMessage, _platform_msg_id: &str) -> Result<()> {
+        anyhow::bail!("native streaming not supported")
+    }
 }
