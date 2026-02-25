@@ -11,13 +11,13 @@
 
 ## Summary
 
-The Agent Job is an ephemeral K8s Job (one per invocation). It is created by the Gateway when a message triggers the cold path. The Job runs a single pod that executes the `claude` CLI, reads per-group context and skills, polls for follow-up messages, and writes results.
+The Agent Job is an ephemeral K8s Job (one per invocation). It is created by the Gateway when a message triggers the cold path. The Job runs a single pod that executes a code agent CLI (e.g., `claude` or `gemini`), reads per-group context and skills, polls for follow-up messages, and writes results.
 
 The Agent Job has **no knowledge** of the Gateway, Connectors, Channels, or the K8s API. It only interacts with the shared PVC via well-defined file paths.
 
 ### Implementation
 
-The agent is implemented as a Rust crate (`crates/kk-agent`) in the kk monorepo. It reuses `kk-core` for queue operations, path conventions, message types, and structured logging. The agent is purely sequential — no async runtime, no tokio. It uses `std::process::Command` to spawn the claude CLI and `std::thread::sleep` for polling.
+The agent is implemented as a Rust crate (`crates/kk-agent`) in the kk monorepo. It reuses `kk-core` for queue operations, path conventions, message types, and structured logging. The agent is purely sequential — no async runtime, no tokio. It uses `std::process::Command` to spawn the agent CLI and `std::thread::sleep` for polling.
 
 ### Lifecycle
 
@@ -28,8 +28,8 @@ Gateway creates Job → Pod scheduled → Phase 0 (skills) → Phase 1 (prompt) 
 | Phase | Duration | What happens |
 |---|---|---|
 | **Phase 0** | ~0.5s | Symlink skills into session directory |
-| **Phase 1** | 3–60s | Read prompt from `request.json`, build context, run claude, write streaming response |
-| **Phase 2** | 0–120s | Poll per-group queue for follow-ups, resume claude for each |
+| **Phase 1** | 3–60s | Read prompt from `request.json`, build context, run agent, write streaming response |
+| **Phase 2** | 0–120s | Poll per-group queue for follow-ups, resume agent for each |
 | **Phase 3** | ~0.1s | Write final status, exit |
 
 ---
@@ -42,11 +42,13 @@ crates/kk-agent/
   src/
     lib.rs          # pub mod declarations
     main.rs         # fn main() → run() sequential entrypoint
+    agent.rs        # CodeAgent trait definition
+    claude.rs       # Claude implementation of CodeAgent
+    gemini.rs       # Gemini implementation of CodeAgent
     config.rs       # AgentConfig::from_env()
-    claude.rs       # spawn_claude(), spawn_claude_resume() via std::process::Command
     phases.rs       # phase_0_skills, phase_1_prompt, phase_2_followups, phase_3_done
   tests/
-    e2e_agent.rs    # 19 integration tests with mock claude binary
+    e2e_agent.rs    # 20 integration tests with mock binaries
 ```
 
 ### Dependencies (minimal)
@@ -105,9 +107,11 @@ Set by the Gateway when creating the Job (see [Gateway](kk-gateway.md) — Job S
 | `GROUP` | `family-chat` | **yes** | Group slug — determines session dir and follow-up queue |
 | `DATA_DIR` | `/data` | no (default `/data`) | PVC mount path |
 | `IDLE_TIMEOUT` | `120` | no (default `120`) | Seconds to wait for follow-ups before exiting Phase 2 |
-| `MAX_TURNS` | `25` | no (default `25`) | Max agentic turns for `claude -p` |
+| `MAX_TURNS` | `25` | no (default `25`) | Max agentic turns for the agent |
 | `THREAD_ID` | `42` | no | Thread ID within group — enables thread-aware paths |
-| `CLAUDE_BIN` | `claude` | no (default `claude`) | Path to claude binary (overridable for testing) |
+| `AGENT_TYPE` | `claude` | no (default `claude`) | Agent type: `claude` or `gemini` |
+| `AGENT_BIN` | `claude` | no | Path to agent binary (overridable for testing, defaults based on type) |
+| `CLAUDE_BIN` | `claude` | no | Legacy alias for `AGENT_BIN` |
 
 The initial prompt is **not** passed via env var. It is read from `request.json` (written by the Gateway before the Job starts) — see Phase 1.
 

@@ -31,7 +31,7 @@ exit {exit_code}
     script
 }
 
-fn make_config(data_dir: &Path, claude_bin: &Path) -> AgentConfig {
+fn make_config(data_dir: &Path, agent_bin: &Path) -> AgentConfig {
     AgentConfig {
         session_id: "test-group-1234".to_string(),
         group: "test-group".to_string(),
@@ -39,7 +39,8 @@ fn make_config(data_dir: &Path, claude_bin: &Path) -> AgentConfig {
         idle_timeout: 1,
         max_turns: 5,
         thread_id: None,
-        claude_bin: claude_bin.to_string_lossy().into_owned(),
+        agent_type: kk_agent::config::AgentType::Claude,
+        agent_bin: agent_bin.to_string_lossy().into_owned(),
     }
 }
 
@@ -118,7 +119,7 @@ fn phase0_skills_injected() {
     fs::create_dir_all(&skill_dir).unwrap();
     fs::write(skill_dir.join("SKILL.md"), "# My Skill").unwrap();
 
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
 
     // Verify .claude/skills/ symlink
     let claude_link = env.session_dir.join(".claude/skills/my-skill");
@@ -142,7 +143,7 @@ fn phase0_missing_skill_md_skipped() {
     fs::create_dir_all(&skill_dir).unwrap();
     fs::write(skill_dir.join("README.md"), "not a skill").unwrap();
 
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
 
     let link = env.session_dir.join(".claude/skills/broken-skill");
     assert!(!link.exists(), "broken skill should not be symlinked");
@@ -156,7 +157,7 @@ fn phase0_no_skills_dir() {
     let _ = fs::remove_dir(&env.paths.skills_dir());
 
     // Should succeed with no skills
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
 }
 
 #[test]
@@ -167,7 +168,7 @@ fn phase0_existing_symlink_overwritten() {
     let skill_v1 = env.paths.skill_dir("evolving-skill");
     fs::create_dir_all(&skill_v1).unwrap();
     fs::write(skill_v1.join("SKILL.md"), "# v1").unwrap();
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
 
     let claude_link = env.session_dir.join(".claude/skills/evolving-skill");
     let target_v1 = fs::read_link(&claude_link).unwrap();
@@ -178,7 +179,7 @@ fn phase0_existing_symlink_overwritten() {
     fs::write(skill_v1.join("SKILL.md"), "# v2 updated").unwrap();
 
     // Run phase 0 again — should overwrite symlink cleanly
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
 
     let target_v2 = fs::read_link(&claude_link).unwrap();
     assert_eq!(target_v2, skill_v1);
@@ -463,7 +464,8 @@ fn phase2_threaded_queue() {
         idle_timeout: 1,
         max_turns: 5,
         thread_id: Some("42".to_string()),
-        claude_bin: mock_bin.to_string_lossy().into_owned(),
+        agent_type: kk_agent::config::AgentType::Claude,
+        agent_bin: mock_bin.to_string_lossy().into_owned(),
     };
 
     fs::create_dir_all(paths.results_dir(&config.session_id)).unwrap();
@@ -531,7 +533,7 @@ fn e2e_full_lifecycle() {
     fs::write(skill_dir.join("SKILL.md"), "# Test").unwrap();
 
     // Phase 0
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
     assert!(env.session_dir.join(".claude/skills/test-skill").exists());
 
     // Phase 1
@@ -563,7 +565,7 @@ fn e2e_lifecycle_with_followup() {
     );
 
     // Phase 0 (no skills)
-    phases::phase_0_skills(&env.paths, &env.session_dir).unwrap();
+    phases::phase_0_skills(&env.config, &env.paths, &env.session_dir).unwrap();
 
     // Phase 1
     phases::phase_1_prompt(&env.config, &env.paths, &env.session_dir).unwrap();
@@ -593,4 +595,74 @@ fn e2e_lifecycle_with_followup() {
         "response should have lines from initial + follow-up, got {}",
         lines.len()
     );
+}
+
+#[test]
+fn e2e_gemini_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let paths = DataPaths::new(&data_dir);
+    paths.ensure_dirs().unwrap();
+
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    
+    // Create a mock gemini binary that also writes a session_id
+    let script = bin_dir.join("mock-gemini");
+    let content = r#"#!/bin/bash
+echo "$@" > .last-args
+echo '{"type":"result","result":"gemini response","session_id":"gemini-sess-999"}'
+exit 0
+"#;
+    fs::write(&script, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let config = AgentConfig {
+        session_id: "test-gemini-123".to_string(),
+        group: "test-group".to_string(),
+        data_dir: data_dir.to_string_lossy().into_owned(),
+        idle_timeout: 1,
+        max_turns: 5,
+        thread_id: None,
+        agent_type: kk_agent::config::AgentType::Gemini,
+        agent_bin: script.to_string_lossy().into_owned(),
+    };
+
+    fs::create_dir_all(paths.results_dir(&config.session_id)).unwrap();
+    let session_dir = paths.session_dir_threaded(&config.group, config.thread_id.as_deref());
+    fs::create_dir_all(&session_dir).unwrap();
+
+    write_request_manifest(&paths, &config.session_id, &config.group, "gemini prompt");
+
+    // Phase 0
+    phases::phase_0_skills(&config, &paths, &session_dir).unwrap();
+    assert!(session_dir.join(".gemini/skills").exists());
+
+    // Phase 1
+    phases::phase_1_prompt(&config, &paths, &session_dir).unwrap();
+    
+    // Verify args
+    let args = fs::read_to_string(session_dir.join(".last-args")).unwrap();
+    assert!(args.contains("-p gemini prompt"));
+    assert!(args.contains("--yolo"));
+    assert!(args.contains("--output-format stream-json"));
+
+    // Phase 2 (with follow-up)
+    let queue_dir = paths.group_queue_dir_threaded(&config.group, config.thread_id.as_deref());
+    enqueue_followup(&queue_dir, "Alice", "gemini follow-up");
+    phases::phase_2_followups(&config, &paths, &session_dir).unwrap();
+
+    // Verify resume args used the session_id from Phase 1
+    let args = fs::read_to_string(session_dir.join(".last-args")).unwrap();
+    assert!(args.contains("--resume gemini-sess-999"));
+    assert!(args.contains("-p [Follow-up from Alice]: gemini follow-up"));
+
+    // Phase 3
+    phases::phase_3_done(&paths, &config.session_id).unwrap();
+    let status = fs::read_to_string(paths.result_status(&config.session_id)).unwrap();
+    assert_eq!(status, "done");
 }

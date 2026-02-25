@@ -1,11 +1,10 @@
 use anyhow::{Context, Result, bail};
 use kk_core::nq;
 use kk_core::paths::DataPaths;
-use kk_core::types::{FollowUpMessage, RequestManifest, ResultLine, ResultStatus};
+use kk_core::types::{FollowUpMessage, RequestManifest, ResultStatus};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
-use crate::claude;
 use crate::config::AgentConfig;
 
 const POLL_INTERVAL: Duration = Duration::from_secs(2);
@@ -14,8 +13,11 @@ const POLL_INTERVAL: Duration = Duration::from_secs(2);
 // Phase 0: Symlink skills into session directory
 // ---------------------------------------------------------------------------
 
-pub fn phase_0_skills(paths: &DataPaths, session_dir: &Path) -> Result<()> {
+pub fn phase_0_skills(config: &AgentConfig, paths: &DataPaths, session_dir: &Path) -> Result<()> {
     tracing::info!("phase 0: injecting skills");
+
+    let agent = config.agent_type.get_agent();
+    let skill_dir_name = agent.skill_dir_name();
 
     let skills_dir = paths.skills_dir();
     if !skills_dir.exists() {
@@ -25,9 +27,9 @@ pub fn phase_0_skills(paths: &DataPaths, session_dir: &Path) -> Result<()> {
 
     let entries = std::fs::read_dir(&skills_dir).context("read skills directory")?;
 
-    let claude_skills_dir = session_dir.join(".claude").join("skills");
+    let agent_skills_dir = session_dir.join(skill_dir_name).join("skills");
     let agents_skills_dir = session_dir.join(".agents").join("skills");
-    std::fs::create_dir_all(&claude_skills_dir)?;
+    std::fs::create_dir_all(&agent_skills_dir)?;
     std::fs::create_dir_all(&agents_skills_dir)?;
 
     let mut count = 0u32;
@@ -48,16 +50,16 @@ pub fn phase_0_skills(paths: &DataPaths, session_dir: &Path) -> Result<()> {
             continue;
         }
 
-        // Symlink into .claude/skills/
-        let claude_link = claude_skills_dir.join(&skill_name);
-        let _ = std::fs::remove_file(&claude_link);
-        std::os::unix::fs::symlink(&skill_path, &claude_link)
+        // Symlink into agent's skills dir (e.g. .claude/skills/ or .gemini/skills/)
+        let agent_link = agent_skills_dir.join(&skill_name);
+        let _ = std::fs::remove_file(&agent_link);
+        std::os::unix::fs::symlink(&skill_path, &agent_link)
             .with_context(|| format!("symlink skill '{skill_name_str}'"))?;
 
-        // Symlink into .agents/skills/ (chained from .claude/skills/)
+        // Symlink into .agents/skills/ (chained from agent's skills dir)
         let agents_link = agents_skills_dir.join(&skill_name);
         let _ = std::fs::remove_file(&agents_link);
-        std::os::unix::fs::symlink(&claude_link, &agents_link)
+        std::os::unix::fs::symlink(&agent_link, &agents_link)
             .with_context(|| format!("agents symlink for skill '{skill_name_str}'"))?;
 
         count += 1;
@@ -73,6 +75,8 @@ pub fn phase_0_skills(paths: &DataPaths, session_dir: &Path) -> Result<()> {
 
 pub fn phase_1_prompt(config: &AgentConfig, paths: &DataPaths, session_dir: &Path) -> Result<()> {
     tracing::info!("phase 1: processing initial prompt");
+
+    let agent = config.agent_type.get_agent();
 
     // Read request manifest
     let manifest_path = paths.request_manifest(&config.session_id);
@@ -112,22 +116,22 @@ pub fn phase_1_prompt(config: &AgentConfig, paths: &DataPaths, session_dir: &Pat
     let status_path = paths.result_status(&config.session_id);
     std::fs::write(&status_path, ResultStatus::Running.as_str()).context("write status=running")?;
 
-    // Spawn claude
+    // Spawn agent
     let response_path = paths.result_response(&config.session_id);
     let log_path = paths.results_dir(&config.session_id).join("agent.log");
 
-    // Check for previous Claude session to resume
-    let claude_sid_path = paths.claude_session_id_file(&config.group, config.thread_id.as_deref());
-    let prev_claude_session = std::fs::read_to_string(&claude_sid_path)
+    // Check for previous agent session to resume
+    let agent_sid_path = paths.claude_session_id_file(&config.group, config.thread_id.as_deref());
+    let prev_agent_session = std::fs::read_to_string(&agent_sid_path)
         .ok()
         .filter(|s| !s.trim().is_empty());
 
-    let result = if let Some(ref claude_sid) = prev_claude_session {
-        tracing::info!(claude_session_id = %claude_sid.trim(), "resuming previous cross-Job session");
-        claude::spawn_claude_with_session(
-            &config.claude_bin,
+    let result = if let Some(ref agent_sid) = prev_agent_session {
+        tracing::info!(session_id = %agent_sid.trim(), "resuming previous cross-Job session");
+        agent.spawn_with_session(
+            &config.agent_bin,
             &full_prompt,
-            claude_sid.trim(),
+            agent_sid.trim(),
             config.max_turns,
             session_dir,
             &response_path,
@@ -135,11 +139,12 @@ pub fn phase_1_prompt(config: &AgentConfig, paths: &DataPaths, session_dir: &Pat
         )?
     } else {
         tracing::info!(
+            agent = %config.agent_type.as_str(),
             max_turns = config.max_turns,
-            "running claude -p (fresh session)"
+            "running agent -p (fresh session)"
         );
-        claude::spawn_claude(
-            &config.claude_bin,
+        agent.spawn(
+            &config.agent_bin,
             &full_prompt,
             config.max_turns,
             session_dir,
@@ -149,57 +154,40 @@ pub fn phase_1_prompt(config: &AgentConfig, paths: &DataPaths, session_dir: &Pat
     };
 
     if result.exit_code == 1 {
-        tracing::error!(exit_code = 1, "claude exited with fatal error");
+        tracing::error!(exit_code = 1, "agent exited with fatal error");
         std::fs::write(&status_path, ResultStatus::Error.as_str()).context("write status=error")?;
-        bail!("claude exited with fatal error (exit code 1)");
+        bail!("agent exited with fatal error (exit code 1)");
     }
 
     if result.exit_code != 0 {
         tracing::warn!(
             exit_code = result.exit_code,
-            "claude exited with non-fatal error"
+            "agent exited with non-fatal error"
         );
     }
 
     // Check for context overflow
-    if detect_context_overflow(&response_path, &log_path) {
+    if agent.detect_overflow(&response_path, &log_path) {
         tracing::warn!("context overflow detected after phase 1");
         std::fs::write(&status_path, ResultStatus::Overflow.as_str())
             .context("write status=overflow")?;
         return Ok(());
     }
 
-    // Persist Claude's session_id for cross-Job resume
-    if let Some(claude_sid) = extract_claude_session_id(&response_path) {
-        if let Some(parent) = claude_sid_path.parent() {
+    // Persist agent's session_id for cross-Job resume
+    if let Some(agent_sid) = agent.extract_session_id(&response_path) {
+        if let Some(parent) = agent_sid_path.parent() {
             let _ = std::fs::create_dir_all(parent);
         }
-        if let Err(e) = std::fs::write(&claude_sid_path, &claude_sid) {
-            tracing::warn!(error = %e, "failed to persist claude session_id");
+        if let Err(e) = std::fs::write(&agent_sid_path, &agent_sid) {
+            tracing::warn!(error = %e, "failed to persist agent session_id");
         } else {
-            tracing::info!(claude_session_id = %claude_sid, "persisted claude session_id");
+            tracing::info!(agent_session_id = %agent_sid, "persisted agent session_id");
         }
     }
 
     tracing::info!("phase 1 complete");
     Ok(())
-}
-
-/// Extract Claude's internal session_id from response.jsonl.
-/// Scans backwards for efficiency — the session_id typically appears in the last "result" line.
-fn extract_claude_session_id(response_path: &Path) -> Option<String> {
-    let content = std::fs::read_to_string(response_path).ok()?;
-    for line in content.lines().rev() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(rl) = serde_json::from_str::<ResultLine>(line)
-            && let Some(sid) = rl.session_id
-        {
-            return Some(sid);
-        }
-    }
-    None
 }
 
 fn build_prompt(soul: Option<&str>, group: Option<&str>, prompt: &str) -> String {
@@ -231,8 +219,18 @@ pub fn phase_2_followups(
     let response_path = paths.result_response(&config.session_id);
     let log_path = paths.results_dir(&config.session_id).join("agent.log");
 
+    let agent = config.agent_type.get_agent();
+
+    // Check for persisted agent session to resume
+    let agent_sid_path = paths.claude_session_id_file(&config.group, config.thread_id.as_deref());
+    let mut current_sid = std::fs::read_to_string(&agent_sid_path)
+        .ok()
+        .map(|s| s.trim().to_string())
+        .filter(|s| !s.is_empty());
+
     tracing::info!(
         idle_timeout_secs = config.idle_timeout,
+        session_id = ?current_sid,
         "phase 2: polling for follow-ups"
     );
 
@@ -300,9 +298,10 @@ pub fn phase_2_followups(
                 "processing follow-up"
             );
 
-            match claude::spawn_claude_resume(
-                &config.claude_bin,
+            match agent.resume(
+                &config.agent_bin,
                 &followup_prompt,
+                current_sid.as_deref(),
                 config.max_turns,
                 session_dir,
                 &response_path,
@@ -311,17 +310,32 @@ pub fn phase_2_followups(
                 Ok(result) if result.exit_code != 0 => {
                     tracing::warn!(
                         exit_code = result.exit_code,
-                        "claude --resume exited with error"
+                        "agent --resume exited with error"
                     );
                 }
                 Err(e) => {
-                    tracing::error!(error = %e, "failed to spawn claude --resume");
+                    tracing::error!(error = %e, "failed to spawn agent --resume");
                 }
                 _ => {}
             }
 
+            // Persist new session ID if it changed (e.g. Gemini might create a new one)
+            if let Some(new_sid) = agent.extract_session_id(&response_path) {
+                if current_sid.as_ref() != Some(&new_sid) {
+                    if let Some(parent) = agent_sid_path.parent() {
+                        let _ = std::fs::create_dir_all(parent);
+                    }
+                    if let Err(e) = std::fs::write(&agent_sid_path, &new_sid) {
+                        tracing::warn!(error = %e, "failed to persist new agent session_id");
+                    } else {
+                        tracing::info!(agent_session_id = %new_sid, "updated persisted agent session_id");
+                        current_sid = Some(new_sid);
+                    }
+                }
+            }
+
             // Check for context overflow after each resume
-            if detect_context_overflow(&response_path, &log_path) {
+            if agent.detect_overflow(&response_path, &log_path) {
                 tracing::warn!("context overflow detected during follow-up");
                 let _ = nq::delete(nq_path);
                 let status_path = paths.result_status(&config.session_id);
@@ -352,28 +366,6 @@ fn truncate(s: &str, max_len: usize) -> &str {
         end -= 1;
     }
     &s[..end]
-}
-
-/// Detect context window overflow by scanning response.jsonl and agent.log.
-fn detect_context_overflow(response_path: &Path, log_path: &Path) -> bool {
-    let overflow_patterns = [
-        "context_length_exceeded",
-        "context window",
-        "maximum context length",
-        "token limit",
-        "too many tokens",
-    ];
-    for path in [response_path, log_path] {
-        if let Ok(content) = std::fs::read_to_string(path) {
-            let lower = content.to_lowercase();
-            for pattern in &overflow_patterns {
-                if lower.contains(pattern) {
-                    return true;
-                }
-            }
-        }
-    }
-    false
 }
 
 // ---------------------------------------------------------------------------
@@ -435,78 +427,5 @@ mod tests {
     #[test]
     fn truncate_long() {
         assert_eq!(truncate("hello world", 5), "hello");
-    }
-
-    #[test]
-    fn extract_session_id_from_result_line() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("response.jsonl");
-        std::fs::write(
-            &path,
-            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
-{"type":"result","result":"hello","session_id":"sess-abc-123"}
-"#,
-        )
-        .unwrap();
-        assert_eq!(
-            extract_claude_session_id(&path),
-            Some("sess-abc-123".to_string())
-        );
-    }
-
-    #[test]
-    fn extract_session_id_missing() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("response.jsonl");
-        std::fs::write(&path, r#"{"type":"result","result":"hello"}"#).unwrap();
-        assert_eq!(extract_claude_session_id(&path), None);
-    }
-
-    #[test]
-    fn extract_session_id_empty_file() {
-        let dir = tempfile::tempdir().unwrap();
-        let path = dir.path().join("response.jsonl");
-        std::fs::write(&path, "").unwrap();
-        assert_eq!(extract_claude_session_id(&path), None);
-    }
-
-    #[test]
-    fn extract_session_id_no_file() {
-        let path = Path::new("/nonexistent/response.jsonl");
-        assert_eq!(extract_claude_session_id(path), None);
-    }
-
-    #[test]
-    fn detect_overflow_in_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let resp = dir.path().join("response.jsonl");
-        let log = dir.path().join("agent.log");
-        std::fs::write(
-            &resp,
-            r#"{"type":"error","error":"context_length_exceeded"}"#,
-        )
-        .unwrap();
-        std::fs::write(&log, "").unwrap();
-        assert!(detect_context_overflow(&resp, &log));
-    }
-
-    #[test]
-    fn detect_overflow_in_log() {
-        let dir = tempfile::tempdir().unwrap();
-        let resp = dir.path().join("response.jsonl");
-        let log = dir.path().join("agent.log");
-        std::fs::write(&resp, "").unwrap();
-        std::fs::write(&log, "Error: maximum context length exceeded").unwrap();
-        assert!(detect_context_overflow(&resp, &log));
-    }
-
-    #[test]
-    fn no_overflow_normal_response() {
-        let dir = tempfile::tempdir().unwrap();
-        let resp = dir.path().join("response.jsonl");
-        let log = dir.path().join("agent.log");
-        std::fs::write(&resp, r#"{"type":"result","result":"hello"}"#).unwrap();
-        std::fs::write(&log, "claude started\nclaude finished").unwrap();
-        assert!(!detect_context_overflow(&resp, &log));
     }
 }

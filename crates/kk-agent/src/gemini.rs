@@ -6,14 +6,14 @@ use kk_core::types::ResultLine;
 
 use crate::agent::{CodeAgent, AgentResult};
 
-pub struct Claude;
+pub struct Gemini;
 
-impl CodeAgent for Claude {
+impl CodeAgent for Gemini {
     fn spawn(
         &self,
         bin: &str,
         prompt: &str,
-        max_turns: u32,
+        _max_turns: u32,
         session_dir: &Path,
         response_path: &Path,
         log_path: &Path,
@@ -28,9 +28,7 @@ impl CodeAgent for Claude {
             .arg(prompt)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--max-turns")
-            .arg(max_turns.to_string())
-            .arg("--verbose")
+            .arg("--yolo")
             .current_dir(session_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
@@ -47,7 +45,7 @@ impl CodeAgent for Claude {
         bin: &str,
         prompt: &str,
         session_id: &str,
-        max_turns: u32,
+        _max_turns: u32,
         session_dir: &Path,
         response_path: &Path,
         log_path: &Path,
@@ -64,9 +62,7 @@ impl CodeAgent for Claude {
             .arg(session_id)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--max-turns")
-            .arg(max_turns.to_string())
-            .arg("--verbose")
+            .arg("--yolo")
             .current_dir(session_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
@@ -82,8 +78,8 @@ impl CodeAgent for Claude {
         &self,
         bin: &str,
         prompt: &str,
-        _session_id: Option<&str>,
-        max_turns: u32,
+        session_id: Option<&str>,
+        _max_turns: u32,
         session_dir: &Path,
         response_path: &Path,
         log_path: &Path,
@@ -99,20 +95,21 @@ impl CodeAgent for Claude {
             .open(log_path)
             .with_context(|| format!("open {} for append", log_path.display()))?;
 
+        let sid = session_id.unwrap_or("latest");
+
         let status = Command::new(bin)
             .arg("-p")
             .arg(prompt)
             .arg("--resume")
+            .arg(sid)
             .arg("--output-format")
             .arg("stream-json")
-            .arg("--max-turns")
-            .arg(max_turns.to_string())
-            .arg("--verbose")
+            .arg("--yolo")
             .current_dir(session_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
             .status()
-            .with_context(|| format!("spawn {bin} --resume"))?;
+            .with_context(|| format!("spawn {bin} --resume {sid}"))?;
 
         Ok(AgentResult {
             exit_code: status.code().unwrap_or(1),
@@ -156,6 +153,6 @@ impl CodeAgent for Claude {
     }
 
     fn skill_dir_name(&self) -> &str {
-        ".claude"
+        ".gemini"
     }
 }

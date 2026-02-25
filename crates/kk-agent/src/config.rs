@@ -1,5 +1,36 @@
 use anyhow::{Context, Result};
 use std::env;
+use crate::agent::CodeAgent;
+
+/// Supported agent types.
+pub enum AgentType {
+    Claude,
+    Gemini,
+}
+
+impl AgentType {
+    pub fn from_str(s: &str) -> Option<Self> {
+        match s.to_lowercase().as_str() {
+            "claude" => Some(Self::Claude),
+            "gemini" => Some(Self::Gemini),
+            _ => None,
+        }
+    }
+
+    pub fn as_str(&self) -> &'static str {
+        match self {
+            Self::Claude => "claude",
+            Self::Gemini => "gemini",
+        }
+    }
+
+    pub fn get_agent(&self) -> Box<dyn CodeAgent> {
+        match self {
+            Self::Claude => Box::new(crate::claude::Claude),
+            Self::Gemini => Box::new(crate::gemini::Gemini),
+        }
+    }
+}
 
 /// Agent configuration parsed from environment variables set by the Gateway.
 pub struct AgentConfig {
@@ -9,7 +40,8 @@ pub struct AgentConfig {
     pub idle_timeout: u64,
     pub max_turns: u32,
     pub thread_id: Option<String>,
-    pub claude_bin: String,
+    pub agent_type: AgentType,
+    pub agent_bin: String,
 }
 
 impl AgentConfig {
@@ -26,7 +58,17 @@ impl AgentConfig {
             .parse::<u32>()
             .context("MAX_TURNS must be a number")?;
         let thread_id = env::var("THREAD_ID").ok().filter(|s| !s.is_empty());
-        let claude_bin = env::var("CLAUDE_BIN").unwrap_or_else(|_| "claude".to_string());
+        
+        let agent_type_str = env::var("AGENT_TYPE").unwrap_or_else(|_| "claude".to_string());
+        let agent_type = AgentType::from_str(&agent_type_str)
+            .with_context(|| format!("invalid AGENT_TYPE: {agent_type_str}"))?;
+
+        let agent_bin = env::var("AGENT_BIN").or_else(|_| env::var("CLAUDE_BIN")).unwrap_or_else(|_| {
+            match agent_type {
+                AgentType::Claude => "claude".to_string(),
+                AgentType::Gemini => "gemini".to_string(),
+            }
+        });
 
         Ok(Self {
             session_id,
@@ -35,7 +77,8 @@ impl AgentConfig {
             idle_timeout,
             max_turns,
             thread_id,
-            claude_bin,
+            agent_type,
+            agent_bin,
         })
     }
 }

@@ -17,7 +17,7 @@ fn run() -> Result<()> {
         "agent starting"
     );
 
-    kk_agent::phases::phase_0_skills(&paths, &session_dir)?;
+    kk_agent::phases::phase_0_skills(&config, &paths, &session_dir)?;
     kk_agent::phases::phase_1_prompt(&config, &paths, &session_dir)?;
     kk_agent::phases::phase_2_followups(&config, &paths, &session_dir)?;
 
