@@ -13,15 +13,13 @@
 
 A Skill is not a running process — it is a **data artifact** managed by a CRD. The Skill CRD declares that a particular skill from a git repo should be available to all Agent Jobs. The Controller handles the lifecycle (fetch on create, remove on delete), and Agent Jobs consume skills by symlinking them into the session directory.
 
-This plan covers the Skill as a concept: what it is, how it's structured, how users interact with it, and how it flows through the system end-to-end.
-
 ### Touchpoints
 
 | Component | Role with Skills |
 |---|---|
 | **User** | Creates/deletes Skill CRs via kubectl |
 | **Controller** | Clones repo, validates SKILL.md, copies to PVC, updates CR status |
-| **Agent Job** | Phase 0: symlinks `/data/skills/*` into session `.claude/skills/` and `.agents/skills/` |
+| **Agent Job** | Phase 0: symlinks `/data/skills/*` into session `.{agent}/skills/` and `.agents/skills/` |
 | **LLM (Claude Code)** | Discovers skills natively, reads metadata, loads full content when relevant |
 | **Gateway** | No interaction with skills — transparent |
 | **Connector** | No interaction with skills — transparent |
@@ -85,15 +83,14 @@ Use this skill when:
 
 ### YAML Frontmatter Fields
 
+The Controller parses only `name` and `description` from YAML frontmatter (see `SkillFrontmatter` in `crates/kk-controller/src/reconcilers/skill.rs`). All other frontmatter fields are silently ignored by serde.
+
 | Field | Required | Type | Description |
 |---|---|---|---|
 | `name` | **Yes** | string | Unique identifier. Lowercase, hyphens allowed. e.g., `frontend-design` |
-| `description` | **Yes** | string | What the skill does and when to use it. This is the primary routing signal — the LLM reads this to decide relevance. |
-| `metadata` | No | object | Arbitrary key-value pairs |
-| `metadata.internal` | No | boolean | If `true`, skill is hidden from normal discovery |
-| `allowed-tools` | No | list | Tools the skill is allowed to use (agent-specific) |
-| `license` | No | string | License identifier |
-| `compatibility` | No | string | Max 500 chars. Environment requirements. |
+| `description` | **Yes** | string | What the skill does and when to use it. The LLM reads this to decide relevance. |
+
+Both fields must be present and non-empty, or the Controller sets the CR to `Error`.
 
 ### The Description is the Routing Rule
 
@@ -117,72 +114,29 @@ description: "A useful skill for documents."
 
 ## CRD Definition
 
-```yaml
-apiVersion: apiextensions.k8s.io/v1
-kind: CustomResourceDefinition
-metadata:
-  name: skills.kk.io
-spec:
-  group: kk.io
-  versions:
-  - name: v1alpha1
-    served: true
-    storage: true
-    schema:
-      openAPIV3Schema:
-        type: object
-        properties:
-          spec:
-            type: object
-            required: [source]
-            properties:
-              source:
-                type: string
-                description: >
-                  GitHub shorthand path to a specific skill directory.
-                  Format: owner/repo/path/to/skill
-                  Examples:
-                    - vercel-labs/agent-skills/skills/frontend-design
-                    - vercel-labs/agent-skills/skills/vercel-deploy
-                    - myorg/internal-skills/skills/code-review
-          status:
-            type: object
-            properties:
-              phase:
-                type: string
-                enum: [Pending, Fetching, Ready, Error]
-              message:
-                type: string
-              skillName:
-                type: string
-                description: "name field parsed from SKILL.md frontmatter"
-              skillDescription:
-                type: string
-                description: "description field parsed from SKILL.md frontmatter"
-              lastFetched:
-                type: string
-                format: date-time
-    subresources:
-      status: {}
-    additionalPrinterColumns:
-    - name: Source
-      type: string
-      jsonPath: .spec.source
-    - name: Skill
-      type: string
-      jsonPath: .status.skillName
-    - name: Status
-      type: string
-      jsonPath: .status.phase
-    - name: Age
-      type: date
-      jsonPath: .metadata.creationTimestamp
-  scope: Namespaced
-  names:
-    plural: skills
-    singular: skill
-    kind: Skill
-    shortNames: [sk]
+Defined in `crates/kk-controller/src/crd.rs` using `kube::CustomResource`:
+
+```rust
+#[kube(
+    group = "kk.io",
+    version = "v1alpha1",
+    kind = "Skill",
+    plural = "skills",
+    shortname = "sk",
+    status = "SkillStatus",
+    namespaced
+)]
+pub struct SkillSpec {
+    pub source: String,
+}
+
+pub struct SkillStatus {
+    pub phase: String,
+    pub message: String,
+    pub skill_name: String,         // serialized as skillName
+    pub skill_description: String,  // serialized as skillDescription
+    pub last_fetched: String,       // serialized as lastFetched
+}
 ```
 
 ---
@@ -195,13 +149,13 @@ The `spec.source` field uses a GitHub shorthand path:
 owner/repo/path/to/skill
 ```
 
-The Controller parses this into three parts:
+The Controller parses this with `splitn(3, '/')`:
 
 | Part | Extraction | Example |
 |---|---|---|
 | Owner | `parts[0]` | `vercel-labs` |
 | Repo | `parts[1]` | `agent-skills` |
-| Skill path | `parts[2:]` joined by `/` | `skills/frontend-design` |
+| Skill path | `parts[2]` (everything after second `/`) | `skills/frontend-design` |
 
 Clone URL is constructed as:
 ```
@@ -227,9 +181,9 @@ The skill directory is then found at:
 
 | Source | Error |
 |---|---|
-| `vercel-labs` | "Invalid source format. Expected: owner/repo/path/to/skill" (< 3 segments) |
-| `vercel-labs/agent-skills` | Same — no skill path segment |
-| (empty string) | CRD validation rejects (required field) |
+| `vercel-labs` | `expected owner/repo/path, got 'vercel-labs'` |
+| `vercel-labs/agent-skills` | `expected owner/repo/path, got 'vercel-labs/agent-skills'` |
+| `/repo/path` or `owner//path` or `owner/repo/` | `empty segment in source '...'` |
 
 ---
 
@@ -241,7 +195,7 @@ The skill directory is then found at:
 /data/skills/{skill-cr-metadata-name}/
 ```
 
-The directory name is the **Skill CR's `metadata.name`**, NOT the `name` from SKILL.md frontmatter (Protocol §5.2). This prevents collisions if two CRs reference skills with the same frontmatter name from different repos.
+The directory name is the **Skill CR's `metadata.name`**, NOT the `name` from SKILL.md frontmatter. This prevents collisions if two CRs reference skills with the same frontmatter name from different repos.
 
 ### Example Layout
 
@@ -250,40 +204,32 @@ After installing three skills:
 ```
 /data/skills/
 ├── frontend-design/                   ← CR name: frontend-design
-│   └── SKILL.md                       ← from vercel-labs/agent-skills/skills/frontend-design
+│   └── SKILL.md                       ← 0o644
 │
 ├── vercel-deploy/                     ← CR name: vercel-deploy
-│   ├── SKILL.md                       ← from vercel-labs/agent-skills/skills/vercel-deploy
+│   ├── SKILL.md                       ← 0o644
 │   └── scripts/
-│       └── deploy.sh                  ← executable (chmod a+x set by Controller)
+│       └── deploy.sh                  ← 0o755 (executable)
 │
 └── agent-browser/                     ← CR name: agent-browser
-    ├── SKILL.md                       ← from vercel-labs/agent-browser/skills/agent-browser
+    ├── SKILL.md                       ← 0o644
     ├── scripts/
-    │   └── agent-browser.sh
+    │   └── agent-browser.sh           ← 0o755 (executable)
     └── references/
-        └── api-reference.md
+        └── api-reference.md           ← 0o644
 ```
 
 ### Permissions
 
-Set by Controller after copying (see [Controller](kk-controller.md) — Skill Reconciliation):
+Set by `set_skill_permissions()` in `crates/kk-controller/src/reconcilers/skill.rs` after copying:
 
-| Path | Permission | Why |
+| Path | Mode | Why |
 |---|---|---|
-| Skill directory (recursive) | `a+rX` | Agent Jobs may run as a different user. All files must be world-readable, dirs world-executable. |
-| `scripts/` files | `a+x` | Skills may reference scripts that the LLM agent executes. They must be executable. |
+| Directories | `0o755` (rwxr-xr-x) | World-traversable; Agent Jobs may run as a different user |
+| Files named `*.sh`, `*.py`, or `run` | `0o755` (rwxr-xr-x) | Executable by agent |
+| All other files | `0o644` (rw-r--r--) | World-readable |
 
-### Disk Usage
-
-Skills are typically small:
-- A SKILL.md is usually 1–50 KB
-- Scripts are 1–10 KB each
-- References can be up to 500 KB for large docs
-
-Estimated disk usage per skill: **5–100 KB typical**, up to **1 MB** for large skills with many references.
-
-With 50 skills installed, total disk usage: **~5–50 MB**. Negligible on a 10 Gi PVC.
+Executable detection matches filenames anywhere in the skill tree (not just under `scripts/`).
 
 ---
 
@@ -297,9 +243,14 @@ User                    Controller              PVC                    Agent Job
  │  kubectl apply           │                    │                         │
  │  Skill CR ──────────────►│                    │                         │
  │                          │                    │                         │
+ │                          │  set status:       │                         │
+ │                          │  Fetching          │                         │
+ │                          │                    │                         │
  │                          │  git clone         │                         │
- │                          │  (shallow, depth 1)│                         │
- │                          │  ──────────────────►                         │
+ │                          │  --depth 1         │                         │
+ │                          │  --single-branch   │                         │
+ │                          │  --filter=blob:none│                         │
+ │                          │  → /tmp/kk-skill-* │                         │
  │                          │                    │                         │
  │                          │  validate SKILL.md │                         │
  │                          │  parse frontmatter │                         │
@@ -308,10 +259,12 @@ User                    Controller              PVC                    Agent Job
  │                          │  ──────────────────►│                        │
  │                          │                    │  /data/skills/{name}/   │
  │                          │                    │                         │
+ │                          │  set permissions   │                         │
  │                          │  update CR status  │                         │
  │                          │  phase: Ready      │                         │
  │                          │  skillName: ...    │                         │
  │                          │  skillDescription: │                         │
+ │                          │  lastFetched: ...  │                         │
  │                          │                    │                         │
  │  kubectl get skills      │                    │                         │
  │  ◄──────────────────────┤                    │                         │
@@ -322,7 +275,7 @@ User                    Controller              PVC                    Agent Job
  │                          │                    │         │               │
  │                          │                    │  Phase 0: symlink       │
  │                          │                    │  /data/skills/{name}/   │
- │                          │                    │    → .claude/skills/    │
+ │                          │                    │    → .{agent}/skills/   │
  │                          │                    │    → .agents/skills/    │
  │                          │                    │         │               │
  │                          │                    │  Claude discovers skill │
@@ -353,7 +306,7 @@ User                    Controller              PVC
 
 ### Update (pull latest)
 
-There is no in-place update mechanism. The user deletes and recreates the CR:
+There is no in-place update mechanism. Delete and recreate the CR:
 
 ```bash
 kubectl delete skill frontend-design -n kk
@@ -363,11 +316,6 @@ kubectl apply -f skill-frontend-design.yaml
 This triggers:
 1. Delete event → Controller removes `/data/skills/frontend-design/`
 2. Create event → Controller clones fresh, validates, copies to PVC
-
-**Why no auto-update?**
-- Simplicity: no polling git repos, no diffing, no cache invalidation
-- Predictability: the skill on disk matches exactly what was fetched at create time
-- Kubernetes-native: delete + apply is the standard declarative pattern
 
 ---
 
@@ -413,28 +361,16 @@ Claude provides a review citing specific guideline violations
 
 ### Script Execution
 
-If a SKILL.md references scripts:
-
-```markdown
-## How It Works
-
-1. Run the deploy script:
-   ```bash
-   /mnt/skills/user/vercel-deploy/scripts/deploy.sh
-   ```
+Skills may include scripts executable from within the agent session. Since the session dir symlinks to `/data/skills/`, Claude can reference:
 ```
-
-In kk, the script path would be:
+.claude/skills/vercel-deploy/scripts/deploy.sh
+```
+or the underlying path:
 ```
 /data/skills/vercel-deploy/scripts/deploy.sh
 ```
 
-Since the session dir symlinks to `/data/skills/`, Claude can also reference:
-```
-.claude/skills/vercel-deploy/scripts/deploy.sh
-```
-
-Both resolve to the same file via symlinks. Scripts must be executable (handled by Controller).
+Both resolve to the same file. Files matching `*.sh`, `*.py`, or named `run` are made executable by the Controller.
 
 ### Reference Files
 
@@ -446,7 +382,7 @@ Skills may include reference files for deep context:
 For full API details, read `references/api-reference.md`.
 ```
 
-Claude reads `references/api-reference.md` only when it needs the detailed reference — not on every invocation. This keeps the base context light.
+Claude reads `references/api-reference.md` only when it needs the detailed reference — not on every invocation.
 
 ---
 
@@ -540,52 +476,81 @@ kubectl delete skills --all -n kk
 
 ## Status Phases
 
-| Phase | Meaning | Transitions to |
-|---|---|---|
-| `Pending` | CR created, not yet processed | `Fetching` |
-| `Fetching` | Controller is cloning the repo | `Ready` or `Error` |
-| `Ready` | Skill validated and installed on PVC | (terminal — stays here until deleted) |
-| `Error` | Something went wrong | (terminal — user must delete + recreate) |
+| Phase | Meaning |
+|---|---|
+| (empty) | CR just created; reconcile not yet run |
+| `Fetching` | Controller is cloning the repository |
+| `Ready` | Skill validated and installed on PVC |
+| `Error` | Something went wrong; user must delete + recreate |
 
 ```
-                ┌─────────┐
-   CR created → │ Pending │
-                └────┬────┘
-                     │
-                     ▼
-                ┌──────────┐
-                │ Fetching │
-                └────┬─────┘
-                     │
-              ┌──────┴──────┐
-              │             │
-              ▼             ▼
-         ┌────────┐    ┌────────┐
-         │ Ready  │    │ Error  │
-         └────────┘    └────────┘
-              │             │
-              │             │  (user deletes + recreates)
-              │             ▼
-              │        back to Pending
-              │
-              │  (user deletes)
-              ▼
-           CR gone, PVC cleaned
+                ┌────────┐
+   CR created → │        │ (phase is empty string)
+                └───┬────┘
+                    │
+                    ▼
+               ┌──────────┐
+               │ Fetching │
+               └────┬─────┘
+                    │
+             ┌──────┴──────┐
+             │             │
+             ▼             ▼
+        ┌────────┐    ┌────────┐
+        │ Ready  │    │ Error  │
+        └────────┘    └────────┘
+             │             │
+             │             │  (user deletes + recreates)
+             │             ▼
+             │        back to empty
+             │
+             │  (user deletes)
+             ▼
+          CR gone, PVC cleaned
 ```
+
+Invalid source sets `Error` and requeues after 300 seconds. Git clone and validation failures return an error to the controller which requeues after 60 seconds.
 
 ### Error Messages
 
-| Cause | status.message |
+| Cause | `status.message` |
 |---|---|
-| Source has < 3 path segments | `Invalid source format. Expected: owner/repo/path/to/skill. Got: {source}` |
-| Git clone 404 | `git clone failed: repository 'https://github.com/...' not found` |
-| Git clone network error | `git clone failed: Could not resolve host: github.com` |
-| Git clone timeout | `Clone timed out after {N} seconds` |
-| Skill path doesn't exist in repo | `Path 'skills/bad-name' not found in repo owner/repo` |
-| SKILL.md not in directory | `SKILL.md not found at skills/bad-name/SKILL.md` |
-| Missing `name` in frontmatter | `SKILL.md missing required 'name' field in YAML frontmatter` |
-| Missing `description` in frontmatter | `SKILL.md missing required 'description' field in YAML frontmatter` |
-| PVC write failure | `Failed to copy skill to PVC: {OS error}` |
+| Source has < 3 path segments | `expected owner/repo/path, got '{source}'` |
+| Empty segment in source | `empty segment in source '{source}'` |
+| Git clone exit non-zero | `git clone failed: {stderr}` |
+| Git clone OS error | `git clone command error: {e}` |
+| Git clone timeout | `git clone timed out after {N}s` |
+| Skill path not found in repo | `skill path '{path}' not found in repo` |
+| SKILL.md not in directory | `SKILL.md not found in {path}` |
+| Frontmatter YAML parse error | `invalid frontmatter YAML: {e}` |
+| Missing or empty `name` | `frontmatter 'name' is required` |
+| Missing or empty `description` | `frontmatter 'description' is required` |
+| PVC write failure | `io error: {OS error}` (propagated) |
+
+`SKILL_CLONE_TIMEOUT` env var (default `60`): overrides the clone timeout in seconds.
+
+---
+
+## Phase 0: Agent Symlink Injection
+
+Implemented in `crates/kk-agent/src/phases.rs:phase_0_skills()`.
+
+For each entry in `/data/skills/` that is a directory containing a `SKILL.md`:
+
+1. Create `{session_dir}/.{agent}/skills/` (e.g. `.claude/skills/`)
+2. Create `{session_dir}/.agents/skills/`
+3. Symlink `{session_dir}/.{agent}/skills/{name}` → `/data/skills/{name}`
+4. Symlink `{session_dir}/.agents/skills/{name}` → `{session_dir}/.{agent}/skills/{name}` (chained)
+
+The `{agent}` directory name is determined by agent type:
+
+| Agent | Directory |
+|---|---|
+| Claude | `.claude` |
+| Gemini | `.gemini` |
+| Codex | `.codex` |
+
+If `/data/skills/` does not exist, Phase 0 is a no-op. Existing symlinks at the target paths are removed before each new symlink is created.
 
 ---
 
@@ -605,7 +570,7 @@ The trade-off is that two CRs from the same repo trigger two independent `git cl
 
 Always clones the default branch (HEAD). This keeps the CRD simple — one field (`source`), no version tracking.
 
-If reproducibility is needed later, we can add an optional `ref` field:
+If reproducibility is needed later, an optional `ref` field could be added:
 ```yaml
 spec:
   source: vercel-labs/agent-skills/skills/frontend-design
@@ -616,24 +581,9 @@ spec:
 
 Skills do not automatically pull new versions. The version on disk is exactly what was fetched at CR creation time. Update = delete + recreate.
 
-If periodic updates are needed later, options include:
-- A CronJob that deletes + recreates Skill CRs on a schedule
-- An `update` annotation that triggers re-fetch on the next reconcile
-- A `skills update` kubectl plugin
-
 ### All Skills Available to All Groups
 
 There is no per-group skill filtering. Every Agent Job gets every skill. The LLM self-selects based on descriptions.
-
-This is the simplest model and works well because:
-- Skills are lightweight (metadata scan is cheap)
-- The LLM is good at relevance matching
-- Adding per-group filtering adds CRD complexity (selector fields, label matching)
-
-If needed later, per-group filtering could be added via:
-- A `groups` field on the Skill CRD (whitelist)
-- Group labels matching skill labels
-- Gateway passing a skill list as env var to the Job
 
 ### Skills on PVC (not ConfigMaps)
 
@@ -693,54 +643,3 @@ The current design only supports public GitHub repos (`https://github.com/...`).
 - A `secretRef` field on the Skill CRD (containing a GitHub token)
 - SSH clone URLs with a deploy key Secret
 - Git credential helper configured in the Controller image
-
----
-
-## Testing Checklist
-
-### CRD
-- [ ] Skill CR with valid source → accepted by API server
-- [ ] Skill CR without source → rejected (required field)
-- [ ] `kubectl get skills` shows Source, Skill, Status, Age columns
-- [ ] `kubectl describe skill {name}` shows full status fields
-- [ ] Short name `sk` works: `kubectl get sk`
-
-### Install Flow
-- [ ] Create Skill CR → Controller clones repo → files appear at `/data/skills/{name}/`
-- [ ] SKILL.md frontmatter parsed → status.skillName + status.skillDescription populated
-- [ ] status.phase transitions: Pending → Fetching → Ready
-- [ ] status.lastFetched set to current time
-- [ ] Scripts have executable permissions
-- [ ] All files are world-readable
-
-### Error Cases
-- [ ] Source with < 3 segments → status=Error with clear message
-- [ ] Non-existent repo → status=Error with git stderr
-- [ ] Valid repo, non-existent path → status=Error
-- [ ] Path exists but no SKILL.md → status=Error
-- [ ] SKILL.md missing `name` → status=Error
-- [ ] SKILL.md missing `description` → status=Error
-- [ ] Git clone timeout → status=Error
-
-### Uninstall Flow
-- [ ] Delete Skill CR → `/data/skills/{name}/` removed from PVC
-- [ ] Next Agent Job → skill not symlinked
-- [ ] Running Agent Job → dangling symlink, agent ignores
-
-### Update Flow
-- [ ] Delete + recreate CR → old files removed, fresh clone, new files installed
-- [ ] Status shows new lastFetched timestamp
-
-### Multi-Skill from Same Repo
-- [ ] Two CRs from `vercel-labs/agent-skills` → both installed independently
-- [ ] Delete one → other unaffected
-- [ ] Both show correct skillName/skillDescription from their own SKILL.md
-
-### Agent Integration
-- [ ] Skills symlinked into `.claude/skills/` in session dir
-- [ ] Skills symlinked into `.agents/skills/` in session dir
-- [ ] Claude Code discovers skills (metadata scan)
-- [ ] Relevant skill loaded when prompt matches description
-- [ ] Irrelevant skills NOT loaded (verify via agent.log token usage)
-- [ ] Skill scripts executable from within agent session
-- [ ] Skill references readable from within agent session
