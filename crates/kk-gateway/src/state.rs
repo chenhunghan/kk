@@ -1,17 +1,15 @@
 use std::collections::HashMap;
 use std::sync::Arc;
 
-use anyhow::{Context, Result};
-use k8s_openapi::api::batch::v1::Job;
-use kube::api::ListParams;
-use kube::{Api, Client};
+use anyhow::Result;
 use tokio::sync::RwLock;
 use tracing::{info, warn};
 
 use kk_core::paths::DataPaths;
-use kk_core::types::GroupsConfig;
+use kk_core::types::{GroupsConfig, RequestManifest};
 
 use crate::config::GatewayConfig;
+use crate::launcher::Launcher;
 
 /// Tracks a running Agent Job for a group (or group+thread).
 #[derive(Debug, Clone)]
@@ -28,7 +26,7 @@ pub struct ActiveJob {
 #[derive(Clone)]
 pub struct SharedState {
     pub config: GatewayConfig,
-    pub client: Client,
+    pub launcher: Arc<dyn Launcher>,
     pub paths: DataPaths,
     pub active_jobs: Arc<RwLock<HashMap<String, ActiveJob>>>,
     pub groups_config: Arc<RwLock<GroupsConfig>>,
@@ -46,80 +44,124 @@ pub fn routing_key(group: &str, thread_id: Option<&str>) -> String {
 }
 
 impl SharedState {
-    pub fn new(config: GatewayConfig, client: Client, paths: &DataPaths) -> Result<Self> {
+    pub fn new(
+        config: GatewayConfig,
+        launcher: Arc<dyn Launcher>,
+        paths: &DataPaths,
+    ) -> Result<Self> {
         let groups_config = load_groups_config(paths)?;
         info!(groups = groups_config.groups.len(), "loaded groups config");
 
         Ok(Self {
             paths: paths.clone(),
             config,
-            client,
+            launcher,
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             groups_config: Arc::new(RwLock::new(groups_config)),
             stream_offsets: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 
-    /// Rebuild active_jobs from existing K8s Jobs on startup.
-    /// This handles gateway restarts — we scan for running agent Jobs
-    /// so we don't create duplicates.
-    pub async fn rebuild_active_jobs(&self) -> Result<()> {
-        let jobs_api: Api<Job> = Api::namespaced(self.client.clone(), &self.config.namespace);
-        let lp = ListParams::default().labels("app=kk-agent");
-        let job_list = jobs_api
-            .list(&lp)
-            .await
-            .context("failed to list agent Jobs")?;
+    /// File-based recovery: scan /data/results/*/status for "running" entries.
+    /// Works identically in K8s and local mode.
+    pub async fn rebuild_active_jobs_from_files(&self) -> Result<()> {
+        let results_base = self.paths.results_dir("");
+        let parent = results_base.parent().unwrap_or(&results_base);
+
+        if !parent.exists() {
+            return Ok(());
+        }
+
+        let entries = match std::fs::read_dir(parent) {
+            Ok(e) => e,
+            Err(_) => return Ok(()),
+        };
 
         let mut active = self.active_jobs.write().await;
-        for job in job_list.items {
-            let labels = job.metadata.labels.as_ref();
-            let name = job.metadata.name.clone().unwrap_or_default();
+        let mut count = 0u32;
 
-            // Skip completed/failed Jobs
-            if let Some(status) = &job.status
-                && (status.succeeded.unwrap_or(0) > 0 || status.failed.unwrap_or(0) > 0)
+        for entry in entries.flatten() {
+            let dir_name = entry.file_name().to_string_lossy().to_string();
+            if dir_name.starts_with('.') || !entry.file_type().map(|t| t.is_dir()).unwrap_or(false)
             {
                 continue;
             }
 
-            let group = labels
-                .and_then(|l| l.get("kk.io/group"))
-                .cloned()
-                .unwrap_or_default();
-            let session_id = labels
-                .and_then(|l| l.get("kk.io/session-id"))
-                .cloned()
-                .unwrap_or_default();
-            let thread_id = labels.and_then(|l| l.get("kk.io/thread-id")).cloned();
+            let status_path = self.paths.result_status(&dir_name);
+            let status = match std::fs::read_to_string(&status_path) {
+                Ok(s) => s,
+                Err(_) => continue,
+            };
 
-            if group.is_empty() || session_id.is_empty() {
-                warn!(job = name, "agent Job missing required labels, skipping");
+            if status.trim() != "running" {
                 continue;
             }
 
-            let created_at = job
-                .metadata
-                .creation_timestamp
-                .as_ref()
-                .map(|t| t.0.timestamp() as u64)
-                .unwrap_or(0);
+            // Read request.json to recover group/thread_id
+            let manifest_path = self.paths.request_manifest(&dir_name);
+            let manifest: RequestManifest = match std::fs::read_to_string(&manifest_path)
+                .ok()
+                .and_then(|s| serde_json::from_str(&s).ok())
+            {
+                Some(m) => m,
+                None => continue,
+            };
 
-            let key = routing_key(&group, thread_id.as_deref());
-            info!(job = name, group, routing_key = key, "recovered active Job");
+            let key = routing_key(&manifest.group, manifest.thread_id.as_deref());
+            info!(
+                session_id = dir_name,
+                group = manifest.group,
+                routing_key = key,
+                "recovered active job from status file"
+            );
             active.insert(
                 key,
                 ActiveJob {
-                    job_name: name,
-                    session_id,
-                    group,
-                    thread_id,
-                    created_at,
+                    job_name: format!("recovered-{dir_name}"),
+                    session_id: dir_name,
+                    group: manifest.group,
+                    thread_id: manifest.thread_id,
+                    created_at: 0,
                 },
             );
+            count += 1;
         }
 
-        info!(count = active.len(), "rebuilt active_jobs from K8s");
+        if count > 0 {
+            info!(count, "rebuilt active_jobs from status files");
+        }
+        Ok(())
+    }
+
+    /// Launcher-specific recovery (K8s recovers from Job labels, local is no-op).
+    pub async fn rebuild_active_jobs_from_launcher(&self) -> Result<()> {
+        let recovered = self.launcher.recover().await?;
+        if recovered.is_empty() {
+            return Ok(());
+        }
+
+        let mut active = self.active_jobs.write().await;
+        for agent in recovered {
+            let key = routing_key(&agent.group, agent.thread_id.as_deref());
+            // Only insert if not already recovered from files
+            active.entry(key.clone()).or_insert_with(|| {
+                info!(
+                    job = agent.handle,
+                    session_id = agent.session_id,
+                    routing_key = key,
+                    "recovered active job from launcher"
+                );
+                ActiveJob {
+                    job_name: agent.handle,
+                    session_id: agent.session_id,
+                    group: agent.group,
+                    thread_id: agent.thread_id,
+                    created_at: agent.created_at,
+                }
+            });
+        }
+
+        info!(count = active.len(), "rebuilt active_jobs from launcher");
         Ok(())
     }
 

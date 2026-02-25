@@ -12,6 +12,10 @@ path = "src/main.rs"
 name = "kk_gateway"
 path = "src/lib.rs"
 
+[features]
+default = ["k8s"]
+k8s = ["dep:kube", "dep:k8s-openapi"]
+
 [dependencies]
 kk-core = { workspace = true }
 tokio = { workspace = true }
@@ -19,11 +23,12 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-kube = { workspace = true }
-k8s-openapi = { workspace = true }
+kube = { workspace = true, optional = true }
+k8s-openapi = { workspace = true, optional = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
 chrono = { workspace = true }
+async-trait = { workspace = true }
 
 [dev-dependencies]
 tempfile = "3"

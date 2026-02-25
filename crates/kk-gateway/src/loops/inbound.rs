@@ -1,16 +1,6 @@
 //! Inbound loop: polls /data/inbound/ and routes messages.
 
-use std::collections::BTreeMap;
-
 use anyhow::{Context, Result};
-use k8s_openapi::api::batch::v1::{Job, JobSpec};
-use k8s_openapi::api::core::v1::{
-    Container, EnvFromSource, EnvVar, PersistentVolumeClaimVolumeSource, PodSpec, PodTemplateSpec,
-    ResourceRequirements, SecretEnvSource, Volume, VolumeMount,
-};
-use k8s_openapi::apimachinery::pkg::api::resource::Quantity;
-use kube::Api;
-use kube::api::PostParams;
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
@@ -191,7 +181,7 @@ fn strip_trigger(text: &str, trigger_mode: &TriggerMode, trigger_pattern: Option
     }
 }
 
-/// Cold path: no active Job for this routing key — create a new Agent Job.
+/// Cold path: no active Job for this routing key — launch a new Agent.
 async fn cold_path(
     state: &SharedState,
     msg: &InboundMessage,
@@ -204,7 +194,7 @@ async fn cold_path(
 
     info!(
         group = msg.group,
-        session_id, job_name, "COLD PATH: creating Agent Job"
+        session_id, job_name, "COLD PATH: launching Agent"
     );
 
     // 1. Create results directory + request.json
@@ -238,32 +228,27 @@ async fn cold_path(
         .group_queue_dir_threaded(&msg.group, msg.thread_id.as_deref());
     std::fs::create_dir_all(&queue_dir)?;
 
-    // 3. Create K8s Job
-    let job = build_agent_job(&job_name, &session_id, msg, &state.config);
-    let jobs_api: Api<Job> = Api::namespaced(state.client.clone(), &state.config.namespace);
-    jobs_api
-        .create(&PostParams::default(), &job)
+    // 3. Launch agent via the launcher abstraction
+    let agent = state
+        .launcher
+        .launch(&job_name, &session_id, msg, &state.config)
         .await
-        .with_context(|| format!("failed to create Job {job_name}"))?;
+        .with_context(|| format!("failed to launch agent {job_name}"))?;
 
     // 4. Update activeJobs
-    let now = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .unwrap()
-        .as_secs();
     let mut active = state.active_jobs.write().await;
     active.insert(
         routing_key.to_string(),
         ActiveJob {
-            job_name: job_name.clone(),
+            job_name: agent.handle,
             session_id,
             group: msg.group.clone(),
             thread_id: msg.thread_id.clone(),
-            created_at: now,
+            created_at: agent.created_at,
         },
     );
 
-    info!(job = job_name, routing_key, "Agent Job created");
+    info!(job = job_name, routing_key, "Agent launched");
     Ok(())
 }
 
@@ -318,125 +303,6 @@ async fn hot_path(state: &SharedState, msg: &InboundMessage, routing_key: &str) 
     Ok(())
 }
 
-/// Build a K8s Job spec for the agent.
-fn build_agent_job(
-    job_name: &str,
-    session_id: &str,
-    msg: &InboundMessage,
-    config: &crate::config::GatewayConfig,
-) -> Job {
-    let mut labels = BTreeMap::new();
-    labels.insert("app".to_string(), "kk-agent".to_string());
-    labels.insert("kk.io/group".to_string(), msg.group.clone());
-    labels.insert("kk.io/session-id".to_string(), session_id.to_string());
-    if let Some(ref tid) = msg.thread_id {
-        labels.insert("kk.io/thread-id".to_string(), tid.clone());
-    }
-
-    let mut env = vec![
-        EnvVar {
-            name: "SESSION_ID".to_string(),
-            value: Some(session_id.to_string()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: "GROUP".to_string(),
-            value: Some(msg.group.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: "DATA_DIR".to_string(),
-            value: Some(config.data_dir.clone()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: "IDLE_TIMEOUT".to_string(),
-            value: Some(config.job_idle_timeout.to_string()),
-            ..Default::default()
-        },
-        EnvVar {
-            name: "MAX_TURNS".to_string(),
-            value: Some(config.job_max_turns.to_string()),
-            ..Default::default()
-        },
-    ];
-
-    if let Some(ref tid) = msg.thread_id {
-        env.push(EnvVar {
-            name: "THREAD_ID".to_string(),
-            value: Some(tid.clone()),
-            ..Default::default()
-        });
-    }
-
-    let container = Container {
-        name: "agent".to_string(),
-        image: Some(config.image_agent.clone()),
-        env: Some(env),
-        env_from: Some(vec![EnvFromSource {
-            secret_ref: Some(SecretEnvSource {
-                name: config.api_keys_secret.clone(),
-                optional: Some(true),
-            }),
-            ..Default::default()
-        }]),
-        resources: Some(ResourceRequirements {
-            requests: Some(BTreeMap::from([
-                ("cpu".to_string(), Quantity(config.job_cpu_request.clone())),
-                (
-                    "memory".to_string(),
-                    Quantity(config.job_memory_request.clone()),
-                ),
-            ])),
-            limits: Some(BTreeMap::from([
-                ("cpu".to_string(), Quantity(config.job_cpu_limit.clone())),
-                (
-                    "memory".to_string(),
-                    Quantity(config.job_memory_limit.clone()),
-                ),
-            ])),
-            ..Default::default()
-        }),
-        volume_mounts: Some(vec![VolumeMount {
-            name: "data".to_string(),
-            mount_path: "/data".to_string(),
-            ..Default::default()
-        }]),
-        ..Default::default()
-    };
-
-    Job {
-        metadata: kube::core::ObjectMeta {
-            name: Some(job_name.to_string()),
-            labels: Some(labels),
-            ..Default::default()
-        },
-        spec: Some(JobSpec {
-            active_deadline_seconds: Some(config.job_active_deadline as i64),
-            ttl_seconds_after_finished: Some(config.job_ttl_after_finished as i32),
-            backoff_limit: Some(0),
-            template: PodTemplateSpec {
-                spec: Some(PodSpec {
-                    restart_policy: Some("Never".to_string()),
-                    containers: vec![container],
-                    volumes: Some(vec![Volume {
-                        name: "data".to_string(),
-                        persistent_volume_claim: Some(PersistentVolumeClaimVolumeSource {
-                            claim_name: config.pvc_claim_name.clone(),
-                            read_only: Some(false),
-                        }),
-                        ..Default::default()
-                    }]),
-                    ..Default::default()
-                }),
-                ..Default::default()
-            },
-            ..Default::default()
-        }),
-        ..Default::default()
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -461,79 +327,6 @@ mod tests {
     fn test_strip_trigger_always() {
         let result = strip_trigger("what is rust?", &TriggerMode::Always, None);
         assert_eq!(result, "what is rust?");
-    }
-
-    #[test]
-    fn test_build_agent_job() {
-        let msg = InboundMessage {
-            channel: "telegram-bot-1".to_string(),
-            channel_type: kk_core::types::ChannelType::Telegram,
-            group: "family-chat".to_string(),
-            thread_id: Some("42".to_string()),
-            sender: "alice".to_string(),
-            text: "hello".to_string(),
-            timestamp: 1708801290,
-            meta: serde_json::json!({}),
-        };
-
-        let config = crate::config::GatewayConfig::from_env();
-        let job = build_agent_job(
-            "agent-family-chat-t42-1708801290",
-            "family-chat-t42-1708801290",
-            &msg,
-            &config,
-        );
-
-        let meta = &job.metadata;
-        assert_eq!(
-            meta.name.as_deref(),
-            Some("agent-family-chat-t42-1708801290")
-        );
-        let labels = meta.labels.as_ref().unwrap();
-        assert_eq!(labels["app"], "kk-agent");
-        assert_eq!(labels["kk.io/group"], "family-chat");
-        assert_eq!(labels["kk.io/thread-id"], "42");
-
-        let spec = job.spec.as_ref().unwrap();
-        assert_eq!(spec.backoff_limit, Some(0));
-
-        let pod_spec = spec.template.spec.as_ref().unwrap();
-        assert_eq!(pod_spec.restart_policy.as_deref(), Some("Never"));
-        assert_eq!(pod_spec.containers.len(), 1);
-
-        let container = &pod_spec.containers[0];
-        let env = container.env.as_ref().unwrap();
-        let session_env = env.iter().find(|e| e.name == "SESSION_ID").unwrap();
-        assert_eq!(
-            session_env.value.as_deref(),
-            Some("family-chat-t42-1708801290")
-        );
-        let thread_env = env.iter().find(|e| e.name == "THREAD_ID").unwrap();
-        assert_eq!(thread_env.value.as_deref(), Some("42"));
-    }
-
-    #[test]
-    fn test_build_agent_job_no_thread() {
-        let msg = InboundMessage {
-            channel: "slack-1".to_string(),
-            channel_type: kk_core::types::ChannelType::Slack,
-            group: "eng".to_string(),
-            thread_id: None,
-            sender: "bob".to_string(),
-            text: "deploy".to_string(),
-            timestamp: 1000,
-            meta: serde_json::json!({}),
-        };
-
-        let config = crate::config::GatewayConfig::from_env();
-        let job = build_agent_job("agent-eng-1000", "eng-1000", &msg, &config);
-
-        let labels = job.metadata.labels.as_ref().unwrap();
-        assert!(!labels.contains_key("kk.io/thread-id"));
-
-        let pod_spec = job.spec.unwrap().template.spec.unwrap();
-        let env = pod_spec.containers[0].env.as_ref().unwrap();
-        assert!(env.iter().all(|e| e.name != "THREAD_ID"));
     }
 
     #[test]

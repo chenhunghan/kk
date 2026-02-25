@@ -508,23 +508,10 @@ async fn groups_d_merge() {
         state_reload_interval_ms: 30000,
     };
 
-    let client = kube::Client::try_from(kube::Config {
-        cluster_url: "https://127.0.0.1:1".parse().unwrap(),
-        default_namespace: "test".to_string(),
-        root_cert: None,
-        connect_timeout: Some(std::time::Duration::from_secs(1)),
-        read_timeout: Some(std::time::Duration::from_secs(1)),
-        write_timeout: Some(std::time::Duration::from_secs(1)),
-        accept_invalid_certs: true,
-        auth_info: Default::default(),
-        proxy_url: None,
-        tls_server_name: None,
-        headers: vec![],
-        disable_compression: false,
-    })
-    .unwrap();
+    let launcher: std::sync::Arc<dyn kk_gateway::launcher::Launcher> =
+        std::sync::Arc::new(common::MockLauncher::new());
 
-    let state = kk_gateway::state::SharedState::new(config, client, &paths).unwrap();
+    let state = kk_gateway::state::SharedState::new(config, launcher, &paths).unwrap();
     let groups = state.groups_config.read().await;
 
     // Both groups should be present

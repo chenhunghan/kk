@@ -11,12 +11,67 @@ use kk_core::types::{
     OutboundMessage, RequestManifest, TriggerMode,
 };
 use kk_gateway::config::GatewayConfig;
+use kk_gateway::launcher::{LaunchedAgent, Launcher};
 use kk_gateway::state::{ActiveJob, SharedState};
 use tokio::sync::RwLock;
 
+/// A no-op launcher for tests that don't actually launch agents.
+pub struct MockLauncher {
+    pub launched: Arc<RwLock<Vec<LaunchedAgent>>>,
+}
+
+impl MockLauncher {
+    pub fn new() -> Self {
+        Self {
+            launched: Arc::new(RwLock::new(Vec::new())),
+        }
+    }
+}
+
+#[async_trait::async_trait]
+impl Launcher for MockLauncher {
+    async fn launch(
+        &self,
+        job_name: &str,
+        session_id: &str,
+        msg: &InboundMessage,
+        _config: &GatewayConfig,
+    ) -> anyhow::Result<LaunchedAgent> {
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        let agent = LaunchedAgent {
+            handle: job_name.to_string(),
+            session_id: session_id.to_string(),
+            group: msg.group.clone(),
+            thread_id: msg.thread_id.clone(),
+            created_at: now,
+        };
+        self.launched.write().await.push(agent.clone());
+        Ok(agent)
+    }
+
+    async fn list_active_handles(&self) -> anyhow::Result<Vec<String>> {
+        Ok(self
+            .launched
+            .read()
+            .await
+            .iter()
+            .map(|a| a.handle.clone())
+            .collect())
+    }
+
+    async fn kill(&self, handle: &str) -> anyhow::Result<()> {
+        let mut launched = self.launched.write().await;
+        launched.retain(|a| a.handle != handle);
+        Ok(())
+    }
+}
+
 /// Test harness for gateway e2e tests.
 /// Creates a temp directory with the full PVC structure and a SharedState
-/// with a dummy kube::Client (never actually called).
+/// with a mock launcher (never calls K8s).
 pub struct GatewayTestHarness {
     pub state: SharedState,
     pub paths: DataPaths,
@@ -64,13 +119,11 @@ impl GatewayTestHarness {
             state_reload_interval_ms: 30000,
         };
 
-        // Build a dummy kube::Client pointing to a non-routable address.
-        // It's never called in our file-based tests.
-        let client = dummy_kube_client();
+        let launcher: Arc<dyn Launcher> = Arc::new(MockLauncher::new());
 
         let state = SharedState {
             config,
-            client,
+            launcher,
             paths: paths.clone(),
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             groups_config: Arc::new(RwLock::new(groups)),
@@ -96,7 +149,7 @@ impl GatewayTestHarness {
         nq::enqueue(&self.paths.inbound_dir(), msg.timestamp, &payload).unwrap();
     }
 
-    /// Simulate cold_path file artifacts without creating a K8s Job.
+    /// Simulate cold_path file artifacts without actually launching an agent.
     /// Creates results dir + request.json + status=running + active_jobs entry.
     /// Returns the session_id.
     pub async fn simulate_cold_path(&self, msg: &InboundMessage) -> String {
@@ -283,24 +336,4 @@ pub fn always_group() -> GroupEntry {
             },
         )]),
     }
-}
-
-/// Construct a dummy kube::Client that points to a non-routable address.
-/// This client is never used for actual API calls in file-based tests.
-fn dummy_kube_client() -> kube::Client {
-    let config = kube::Config {
-        cluster_url: "https://127.0.0.1:1".parse().expect("valid url"),
-        default_namespace: "test".to_string(),
-        root_cert: None,
-        connect_timeout: Some(std::time::Duration::from_secs(1)),
-        read_timeout: Some(std::time::Duration::from_secs(1)),
-        write_timeout: Some(std::time::Duration::from_secs(1)),
-        accept_invalid_certs: true,
-        auth_info: Default::default(),
-        proxy_url: None,
-        tls_server_name: None,
-        headers: vec![],
-        disable_compression: false,
-    };
-    kube::Client::try_from(config).expect("dummy client")
 }

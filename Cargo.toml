@@ -6,6 +6,7 @@ members = [
     "crates/kk-gateway",
     "crates/kk-connector",
     "crates/kk-agent",
+    "crates/kk-cli",
 ]
 
 [workspace.package]
@@ -49,6 +50,7 @@ uuid = { version = "1", features = ["v4"] }
 chrono = { version = "0.4", features = ["serde"] }
 rand = "0.9"
 url = "2"
+serde_yaml = "0.9"
 
 # Internal
 kk-core = { path = "crates/kk-core" }

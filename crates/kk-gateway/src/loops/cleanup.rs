@@ -1,11 +1,8 @@
-//! Cleanup loop: deletes finished K8s Jobs, handles stuck results, purges archives.
+//! Cleanup loop: detects crashed agents, handles stuck results, purges archives.
 
 use std::collections::HashSet;
 
 use anyhow::{Context, Result};
-use k8s_openapi::api::batch::v1::Job;
-use kube::Api;
-use kube::api::{DeleteParams, ListParams};
 use tokio::time::{Duration, sleep};
 use tracing::{debug, error, info, warn};
 
@@ -29,10 +26,16 @@ pub async fn run(state: SharedState) -> Result<()> {
 }
 
 pub async fn cleanup_once(state: &SharedState) -> Result<()> {
-    // 1. Clean up completed/failed K8s Jobs past TTL
-    cleanup_finished_jobs(state).await?;
+    // 1. Clean up finished agents (K8s: delete expired Jobs; local: no-op)
+    if let Err(e) = state
+        .launcher
+        .cleanup_finished(state.config.job_ttl_after_finished)
+        .await
+    {
+        warn!(error = %e, "launcher cleanup_finished error");
+    }
 
-    // 2. Detect crashed Jobs (in activeJobs but K8s Job gone)
+    // 2. Detect crashed agents (in activeJobs but launcher says gone)
     detect_crashed_jobs(state).await?;
 
     // 3. Handle orphaned group queue files
@@ -44,66 +47,19 @@ pub async fn cleanup_once(state: &SharedState) -> Result<()> {
     Ok(())
 }
 
-/// Delete completed/failed K8s Jobs whose TTL has expired.
-/// K8s ttlSecondsAfterFinished should handle most of this, but we
-/// clean up any that slip through.
-async fn cleanup_finished_jobs(state: &SharedState) -> Result<()> {
-    let jobs_api: Api<Job> = Api::namespaced(state.client.clone(), &state.config.namespace);
-    let lp = ListParams::default().labels("app=kk-agent");
-    let job_list = jobs_api.list(&lp).await?;
-
-    for job in job_list.items {
-        let name = job.metadata.name.clone().unwrap_or_default();
-        let status = match &job.status {
-            Some(s) => s,
-            None => continue,
-        };
-
-        let is_finished = status.succeeded.unwrap_or(0) > 0 || status.failed.unwrap_or(0) > 0;
-        if !is_finished {
-            continue;
-        }
-
-        // Check if completion time is past TTL
-        let completion_time = status
-            .completion_time
-            .as_ref()
-            .map(|t| t.0.timestamp() as u64)
-            .unwrap_or(0);
-        let now = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .unwrap()
-            .as_secs();
-
-        if now.saturating_sub(completion_time) > state.config.job_ttl_after_finished {
-            info!(job = name, "deleting expired Job");
-            if let Err(e) = jobs_api.delete(&name, &DeleteParams::default()).await {
-                warn!(job = name, error = %e, "failed to delete expired Job");
-            }
-        }
-    }
-
-    Ok(())
-}
-
-/// Detect Jobs tracked in activeJobs but no longer existing in K8s.
-/// This handles cases where a Job was deleted externally or crashed.
+/// Detect agents tracked in activeJobs but no longer running in the launcher.
 async fn detect_crashed_jobs(state: &SharedState) -> Result<()> {
-    let jobs_api: Api<Job> = Api::namespaced(state.client.clone(), &state.config.namespace);
-    let lp = ListParams::default().labels("app=kk-agent");
-    let job_list = jobs_api.list(&lp).await?;
-
-    // Build set of actual running Job names
-    let actual_jobs: HashSet<String> = job_list
-        .items
-        .iter()
-        .filter_map(|j| j.metadata.name.clone())
+    let actual_handles: HashSet<String> = state
+        .launcher
+        .list_active_handles()
+        .await?
+        .into_iter()
         .collect();
 
     let active = state.active_jobs.read().await;
     let stale_keys: Vec<String> = active
         .iter()
-        .filter(|(_, aj)| !actual_jobs.contains(&aj.job_name))
+        .filter(|(_, aj)| !actual_handles.contains(&aj.job_name))
         .map(|(key, _)| key.clone())
         .collect();
     drop(active);
@@ -119,7 +75,7 @@ async fn detect_crashed_jobs(state: &SharedState) -> Result<()> {
                 routing_key = key,
                 job = aj.job_name,
                 session_id = aj.session_id,
-                "detected crashed/missing Job, removing from activeJobs"
+                "detected crashed/missing agent, removing from activeJobs"
             );
 
             // Mark the result as error if status file exists and is still "running"

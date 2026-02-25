@@ -1288,6 +1288,21 @@ dependencies = [
 ]
 
 [[package]]
+name = "kk-cli"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kk-core",
+ "kk-gateway",
+ "serde",
+ "serde_json",
+ "serde_yaml",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+]
+
+[[package]]
 name = "kk-connector"
 version = "0.1.0"
 dependencies = [
@@ -1356,6 +1371,7 @@ name = "kk-gateway"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "chrono",
  "filetime",
  "k8s-openapi",
