@@ -74,6 +74,7 @@ impl GatewayTestHarness {
             paths: paths.clone(),
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             groups_config: Arc::new(RwLock::new(groups)),
+            stream_offsets: Arc::new(RwLock::new(HashMap::new())),
         };
 
         Self {

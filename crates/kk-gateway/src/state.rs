@@ -32,6 +32,8 @@ pub struct SharedState {
     pub paths: DataPaths,
     pub active_jobs: Arc<RwLock<HashMap<String, ActiveJob>>>,
     pub groups_config: Arc<RwLock<GroupsConfig>>,
+    /// Tracks the last byte offset read from response.jsonl per session_id (for streaming).
+    pub stream_offsets: Arc<RwLock<HashMap<String, u64>>>,
 }
 
 /// Build a routing key for active_jobs lookup.
@@ -54,6 +56,7 @@ impl SharedState {
             client,
             active_jobs: Arc::new(RwLock::new(HashMap::new())),
             groups_config: Arc::new(RwLock::new(groups_config)),
+            stream_offsets: Arc::new(RwLock::new(HashMap::new())),
         })
     }
 

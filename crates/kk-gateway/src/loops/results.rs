@@ -59,7 +59,9 @@ pub async fn poll_once(state: &SharedState) -> Result<()> {
 
         match status {
             ResultStatus::Running => {
-                debug!(dir = dir_name, "agent still running");
+                if let Err(e) = try_stream_partial(state, &dir_name).await {
+                    debug!(dir = dir_name, error = %e, "stream partial error");
+                }
                 continue;
             }
             ResultStatus::Done => {
@@ -72,6 +74,18 @@ pub async fn poll_once(state: &SharedState) -> Result<()> {
                 warn!(dir = dir_name, "processing error result");
                 if let Err(e) = process_error(state, &dir_name).await {
                     error!(dir = dir_name, error = %e, "failed to process error result");
+                }
+            }
+            ResultStatus::Stopped => {
+                info!(dir = dir_name, "processing stopped result");
+                if let Err(e) = process_stopped(state, &dir_name).await {
+                    error!(dir = dir_name, error = %e, "failed to process stopped result");
+                }
+            }
+            ResultStatus::Overflow => {
+                warn!(dir = dir_name, "processing overflow result");
+                if let Err(e) = process_overflow(state, &dir_name).await {
+                    error!(dir = dir_name, error = %e, "failed to process overflow result");
                 }
             }
         }
@@ -95,8 +109,9 @@ async fn process_done(state: &SharedState, session_id: &str) -> Result<()> {
     // 4. Archive results dir
     archive_results(state, session_id)?;
 
-    // 5. Remove from activeJobs
+    // 5. Remove from activeJobs + clean up stream offset
     remove_from_active(state, &manifest).await;
+    state.stream_offsets.write().await.remove(session_id);
 
     info!(session_id, channel = manifest.channel, "result delivered");
     Ok(())
@@ -114,14 +129,175 @@ async fn process_error(state: &SharedState, session_id: &str) -> Result<()> {
     // 3. Archive results dir
     archive_results(state, session_id)?;
 
-    // 4. Remove from activeJobs
+    // 4. Remove from activeJobs + clean up stream offset
     remove_from_active(state, &manifest).await;
+    state.stream_offsets.write().await.remove(session_id);
 
     warn!(
         session_id,
         channel = manifest.channel,
         "error result delivered"
     );
+    Ok(())
+}
+
+/// Process a user-stopped Agent Job result.
+async fn process_stopped(state: &SharedState, session_id: &str) -> Result<()> {
+    let manifest = read_manifest(state, session_id)?;
+
+    let response_path = state.paths.result_response(session_id);
+    let partial_text = extract_response_text(&response_path)?;
+
+    let text = if partial_text == "(no response)" || partial_text == "(no response file)" {
+        "[kk] Agent stopped by user.".to_string()
+    } else {
+        format!("{partial_text}\n\n[kk] (stopped by user)")
+    };
+
+    write_outbound(state, &manifest, &text)?;
+    archive_results(state, session_id)?;
+    remove_from_active(state, &manifest).await;
+    state.stream_offsets.write().await.remove(session_id);
+
+    info!(
+        session_id,
+        channel = manifest.channel,
+        "stopped result delivered"
+    );
+    Ok(())
+}
+
+/// Process a context overflow result.
+async fn process_overflow(state: &SharedState, session_id: &str) -> Result<()> {
+    let manifest = read_manifest(state, session_id)?;
+
+    let response_path = state.paths.result_response(session_id);
+    let partial_text = extract_response_text(&response_path)?;
+
+    let text = if partial_text == "(no response)" || partial_text == "(no response file)" {
+        "[kk] Context window overflow. The conversation has grown too long. Please start a new conversation.".to_string()
+    } else {
+        format!(
+            "{partial_text}\n\n[kk] Context window overflow. Please start a new conversation for further questions."
+        )
+    };
+
+    write_outbound(state, &manifest, &text)?;
+
+    // Clear persisted claude session_id so next Job starts fresh
+    let sid_path = state
+        .paths
+        .claude_session_id_file(&manifest.group, manifest.thread_id.as_deref());
+    let _ = std::fs::remove_file(&sid_path);
+
+    archive_results(state, session_id)?;
+    remove_from_active(state, &manifest).await;
+    state.stream_offsets.write().await.remove(session_id);
+
+    warn!(
+        session_id,
+        channel = manifest.channel,
+        "overflow result delivered, session reset"
+    );
+    Ok(())
+}
+
+/// Read new lines from response.jsonl since last offset, send intermediate messages.
+async fn try_stream_partial(state: &SharedState, session_id: &str) -> Result<()> {
+    let response_path = state.paths.result_response(session_id);
+    if !response_path.exists() {
+        return Ok(());
+    }
+
+    let metadata = std::fs::metadata(&response_path)?;
+    let file_len = metadata.len();
+
+    let offsets = state.stream_offsets.read().await;
+    let last_offset = offsets.get(session_id).copied().unwrap_or(0);
+    drop(offsets);
+
+    if file_len <= last_offset {
+        return Ok(());
+    }
+
+    use std::io::{Read, Seek, SeekFrom};
+    let mut file = std::fs::File::open(&response_path)?;
+    file.seek(SeekFrom::Start(last_offset))?;
+    let mut new_bytes = Vec::new();
+    file.read_to_end(&mut new_bytes)?;
+
+    let new_text = String::from_utf8_lossy(&new_bytes);
+
+    // Extract the latest assistant/result text from new lines
+    let mut latest_text: Option<String> = None;
+    for line in new_text.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rl) = serde_json::from_str::<ResultLine>(line) {
+            if rl.line_type == "result" {
+                if let Some(text) = rl.result {
+                    latest_text = Some(text);
+                }
+            } else if rl.line_type == "assistant"
+                && let Some(msg) = rl.message
+            {
+                for block in msg.content {
+                    if let ContentBlock::Text { text } = block {
+                        latest_text = Some(text);
+                    }
+                }
+            }
+        }
+    }
+
+    // Update offset
+    state
+        .stream_offsets
+        .write()
+        .await
+        .insert(session_id.to_string(), file_len);
+
+    // Send intermediate message if we found new text
+    if let Some(text) = latest_text {
+        let manifest = match read_manifest(state, session_id) {
+            Ok(m) => m,
+            Err(_) => return Ok(()),
+        };
+
+        // Flatten manifest meta into top level so providers can read chat_id/channel_id directly,
+        // then add streaming + session_id fields.
+        let meta = {
+            let mut m = manifest.meta.clone();
+            if let Some(obj) = m.as_object_mut() {
+                obj.insert("streaming".into(), serde_json::Value::Bool(true));
+                obj.insert(
+                    "session_id".into(),
+                    serde_json::Value::String(session_id.to_string()),
+                );
+            }
+            m
+        };
+
+        let outbound = OutboundMessage {
+            channel: manifest.channel.clone(),
+            group: manifest.group.clone(),
+            thread_id: manifest.thread_id.clone(),
+            text,
+            meta,
+        };
+
+        let outbox_dir = state.paths.outbox_dir(&manifest.channel);
+        let payload = serde_json::to_vec(&outbound)?;
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .unwrap()
+            .as_secs();
+        nq::enqueue(&outbox_dir, now, &payload)?;
+
+        debug!(session_id, "sent streaming partial response");
+    }
+
     Ok(())
 }
 

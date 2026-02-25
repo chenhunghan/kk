@@ -98,6 +98,22 @@ impl DataPaths {
         }
     }
 
+    // --- Session state ---
+
+    /// /data/sessions/{group}/claude_session_id (thread-aware)
+    /// Persists Claude's internal session ID for cross-Job resume.
+    pub fn claude_session_id_file(&self, group: &str, thread_id: Option<&str>) -> PathBuf {
+        self.session_dir_threaded(group, thread_id)
+            .join("claude_session_id")
+    }
+
+    /// Stop sentinel file for a group (thread-aware).
+    /// `/data/groups/{group}/_stop` or `/data/groups/{group}/threads/{tid}/_stop`
+    pub fn stop_sentinel(&self, group: &str, thread_id: Option<&str>) -> PathBuf {
+        self.group_queue_dir_threaded(group, thread_id)
+            .join("_stop")
+    }
+
     // --- Memory ---
 
     /// /data/memory/SOUL.md
@@ -281,6 +297,32 @@ mod tests {
         assert_eq!(
             paths.session_dir_threaded("dev-team", Some("42")),
             PathBuf::from("/data/sessions/dev-team/threads/42")
+        );
+    }
+
+    #[test]
+    fn test_claude_session_id_file() {
+        let paths = DataPaths::new("/data");
+        assert_eq!(
+            paths.claude_session_id_file("dev-team", None),
+            PathBuf::from("/data/sessions/dev-team/claude_session_id")
+        );
+        assert_eq!(
+            paths.claude_session_id_file("dev-team", Some("42")),
+            PathBuf::from("/data/sessions/dev-team/threads/42/claude_session_id")
+        );
+    }
+
+    #[test]
+    fn test_stop_sentinel() {
+        let paths = DataPaths::new("/data");
+        assert_eq!(
+            paths.stop_sentinel("dev-team", None),
+            PathBuf::from("/data/groups/dev-team/_stop")
+        );
+        assert_eq!(
+            paths.stop_sentinel("dev-team", Some("42")),
+            PathBuf::from("/data/groups/dev-team/threads/42/_stop")
         );
     }
 

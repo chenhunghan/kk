@@ -130,6 +130,9 @@ async fn detect_crashed_jobs(state: &SharedState) -> Result<()> {
             {
                 let _ = std::fs::write(&status_path, "error");
             }
+
+            // Clean up stream offset
+            state.stream_offsets.write().await.remove(&aj.session_id);
         }
     }
 

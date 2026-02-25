@@ -122,6 +122,11 @@ async fn route_message(state: &SharedState, msg: &InboundMessage) -> Result<()> 
         return Ok(());
     }
 
+    // Check for stop command
+    if is_stop_command(&msg.text) {
+        return handle_stop(state, msg).await;
+    }
+
     // Build thread-aware routing key
     let key = state::routing_key(&msg.group, msg.thread_id.as_deref());
 
@@ -139,6 +144,38 @@ async fn route_message(state: &SharedState, msg: &InboundMessage) -> Result<()> 
         );
         cold_path(state, msg, &key, &prompt).await
     }
+}
+
+/// Check if a message is a stop command.
+fn is_stop_command(text: &str) -> bool {
+    let trimmed = text.trim().to_lowercase();
+    trimmed == "/stop" || trimmed == "stop"
+}
+
+/// Handle a stop command: write sentinel file to the group queue directory.
+async fn handle_stop(state: &SharedState, msg: &InboundMessage) -> Result<()> {
+    let key = state::routing_key(&msg.group, msg.thread_id.as_deref());
+    let active_jobs = state.active_jobs.read().await;
+
+    if !active_jobs.contains_key(&key) {
+        debug!(
+            group = msg.group,
+            "stop command but no active Job, ignoring"
+        );
+        return Ok(());
+    }
+    drop(active_jobs);
+
+    info!(group = msg.group, "STOP: writing stop sentinel");
+    let stop_path = state
+        .paths
+        .stop_sentinel(&msg.group, msg.thread_id.as_deref());
+    if let Some(parent) = stop_path.parent() {
+        std::fs::create_dir_all(parent)?;
+    }
+    std::fs::write(&stop_path, "stop").context("write stop sentinel")?;
+
+    Ok(())
 }
 
 /// Strip trigger pattern from message text.
@@ -497,5 +534,17 @@ mod tests {
         let pod_spec = job.spec.unwrap().template.spec.unwrap();
         let env = pod_spec.containers[0].env.as_ref().unwrap();
         assert!(env.iter().all(|e| e.name != "THREAD_ID"));
+    }
+
+    #[test]
+    fn test_is_stop_command() {
+        assert!(is_stop_command("/stop"));
+        assert!(is_stop_command("stop"));
+        assert!(is_stop_command("STOP"));
+        assert!(is_stop_command("/Stop"));
+        assert!(is_stop_command("  /stop  "));
+        assert!(!is_stop_command("please stop"));
+        assert!(!is_stop_command("/stop now"));
+        assert!(!is_stop_command("don't stop"));
     }
 }

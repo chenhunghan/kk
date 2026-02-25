@@ -1,7 +1,7 @@
 use anyhow::{Context, Result, bail};
 use kk_core::nq;
 use kk_core::paths::DataPaths;
-use kk_core::types::{FollowUpMessage, RequestManifest, ResultStatus};
+use kk_core::types::{FollowUpMessage, RequestManifest, ResultLine, ResultStatus};
 use std::path::Path;
 use std::time::{Duration, Instant};
 
@@ -116,16 +116,37 @@ pub fn phase_1_prompt(config: &AgentConfig, paths: &DataPaths, session_dir: &Pat
     let response_path = paths.result_response(&config.session_id);
     let log_path = paths.results_dir(&config.session_id).join("agent.log");
 
-    tracing::info!(max_turns = config.max_turns, "running claude -p");
+    // Check for previous Claude session to resume
+    let claude_sid_path = paths.claude_session_id_file(&config.group, config.thread_id.as_deref());
+    let prev_claude_session = std::fs::read_to_string(&claude_sid_path)
+        .ok()
+        .filter(|s| !s.trim().is_empty());
 
-    let result = claude::spawn_claude(
-        &config.claude_bin,
-        &full_prompt,
-        config.max_turns,
-        session_dir,
-        &response_path,
-        &log_path,
-    )?;
+    let result = if let Some(ref claude_sid) = prev_claude_session {
+        tracing::info!(claude_session_id = %claude_sid.trim(), "resuming previous cross-Job session");
+        claude::spawn_claude_with_session(
+            &config.claude_bin,
+            &full_prompt,
+            claude_sid.trim(),
+            config.max_turns,
+            session_dir,
+            &response_path,
+            &log_path,
+        )?
+    } else {
+        tracing::info!(
+            max_turns = config.max_turns,
+            "running claude -p (fresh session)"
+        );
+        claude::spawn_claude(
+            &config.claude_bin,
+            &full_prompt,
+            config.max_turns,
+            session_dir,
+            &response_path,
+            &log_path,
+        )?
+    };
 
     if result.exit_code == 1 {
         tracing::error!(exit_code = 1, "claude exited with fatal error");
@@ -140,8 +161,45 @@ pub fn phase_1_prompt(config: &AgentConfig, paths: &DataPaths, session_dir: &Pat
         );
     }
 
+    // Check for context overflow
+    if detect_context_overflow(&response_path, &log_path) {
+        tracing::warn!("context overflow detected after phase 1");
+        std::fs::write(&status_path, ResultStatus::Overflow.as_str())
+            .context("write status=overflow")?;
+        return Ok(());
+    }
+
+    // Persist Claude's session_id for cross-Job resume
+    if let Some(claude_sid) = extract_claude_session_id(&response_path) {
+        if let Some(parent) = claude_sid_path.parent() {
+            let _ = std::fs::create_dir_all(parent);
+        }
+        if let Err(e) = std::fs::write(&claude_sid_path, &claude_sid) {
+            tracing::warn!(error = %e, "failed to persist claude session_id");
+        } else {
+            tracing::info!(claude_session_id = %claude_sid, "persisted claude session_id");
+        }
+    }
+
     tracing::info!("phase 1 complete");
     Ok(())
+}
+
+/// Extract Claude's internal session_id from response.jsonl.
+/// Scans backwards for efficiency — the session_id typically appears in the last "result" line.
+fn extract_claude_session_id(response_path: &Path) -> Option<String> {
+    let content = std::fs::read_to_string(response_path).ok()?;
+    for line in content.lines().rev() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        if let Ok(rl) = serde_json::from_str::<ResultLine>(line)
+            && let Some(sid) = rl.session_id
+        {
+            return Some(sid);
+        }
+    }
+    None
 }
 
 fn build_prompt(soul: Option<&str>, group: Option<&str>, prompt: &str) -> String {
@@ -185,6 +243,17 @@ pub fn phase_2_followups(
     loop {
         if last_activity.elapsed() >= idle_timeout {
             break;
+        }
+
+        // Check for stop sentinel
+        let stop_path = paths.stop_sentinel(&config.group, config.thread_id.as_deref());
+        if stop_path.exists() {
+            tracing::info!("stop sentinel detected, ending phase 2 early");
+            let _ = std::fs::remove_file(&stop_path);
+            let status_path = paths.result_status(&config.session_id);
+            std::fs::write(&status_path, ResultStatus::Stopped.as_str())
+                .context("write status=stopped")?;
+            return Ok(());
         }
 
         let pending = nq::list_pending(&queue_dir)?;
@@ -251,6 +320,16 @@ pub fn phase_2_followups(
                 _ => {}
             }
 
+            // Check for context overflow after each resume
+            if detect_context_overflow(&response_path, &log_path) {
+                tracing::warn!("context overflow detected during follow-up");
+                let _ = nq::delete(nq_path);
+                let status_path = paths.result_status(&config.session_id);
+                std::fs::write(&status_path, ResultStatus::Overflow.as_str())
+                    .context("write status=overflow")?;
+                return Ok(());
+            }
+
             let _ = nq::delete(nq_path);
             followup_count += 1;
             tracing::info!(count = followup_count, "follow-up processed");
@@ -273,6 +352,28 @@ fn truncate(s: &str, max_len: usize) -> &str {
         end -= 1;
     }
     &s[..end]
+}
+
+/// Detect context window overflow by scanning response.jsonl and agent.log.
+fn detect_context_overflow(response_path: &Path, log_path: &Path) -> bool {
+    let overflow_patterns = [
+        "context_length_exceeded",
+        "context window",
+        "maximum context length",
+        "token limit",
+        "too many tokens",
+    ];
+    for path in [response_path, log_path] {
+        if let Ok(content) = std::fs::read_to_string(path) {
+            let lower = content.to_lowercase();
+            for pattern in &overflow_patterns {
+                if lower.contains(pattern) {
+                    return true;
+                }
+            }
+        }
+    }
+    false
 }
 
 // ---------------------------------------------------------------------------
@@ -334,5 +435,78 @@ mod tests {
     #[test]
     fn truncate_long() {
         assert_eq!(truncate("hello world", 5), "hello");
+    }
+
+    #[test]
+    fn extract_session_id_from_result_line() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response.jsonl");
+        std::fs::write(
+            &path,
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"hi"}]}}
+{"type":"result","result":"hello","session_id":"sess-abc-123"}
+"#,
+        )
+        .unwrap();
+        assert_eq!(
+            extract_claude_session_id(&path),
+            Some("sess-abc-123".to_string())
+        );
+    }
+
+    #[test]
+    fn extract_session_id_missing() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response.jsonl");
+        std::fs::write(&path, r#"{"type":"result","result":"hello"}"#).unwrap();
+        assert_eq!(extract_claude_session_id(&path), None);
+    }
+
+    #[test]
+    fn extract_session_id_empty_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("response.jsonl");
+        std::fs::write(&path, "").unwrap();
+        assert_eq!(extract_claude_session_id(&path), None);
+    }
+
+    #[test]
+    fn extract_session_id_no_file() {
+        let path = Path::new("/nonexistent/response.jsonl");
+        assert_eq!(extract_claude_session_id(path), None);
+    }
+
+    #[test]
+    fn detect_overflow_in_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = dir.path().join("response.jsonl");
+        let log = dir.path().join("agent.log");
+        std::fs::write(
+            &resp,
+            r#"{"type":"error","error":"context_length_exceeded"}"#,
+        )
+        .unwrap();
+        std::fs::write(&log, "").unwrap();
+        assert!(detect_context_overflow(&resp, &log));
+    }
+
+    #[test]
+    fn detect_overflow_in_log() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = dir.path().join("response.jsonl");
+        let log = dir.path().join("agent.log");
+        std::fs::write(&resp, "").unwrap();
+        std::fs::write(&log, "Error: maximum context length exceeded").unwrap();
+        assert!(detect_context_overflow(&resp, &log));
+    }
+
+    #[test]
+    fn no_overflow_normal_response() {
+        let dir = tempfile::tempdir().unwrap();
+        let resp = dir.path().join("response.jsonl");
+        let log = dir.path().join("agent.log");
+        std::fs::write(&resp, r#"{"type":"result","result":"hello"}"#).unwrap();
+        std::fs::write(&log, "claude started\nclaude finished").unwrap();
+        assert!(!detect_context_overflow(&resp, &log));
     }
 }

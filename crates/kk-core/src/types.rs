@@ -64,6 +64,8 @@ pub enum ResultStatus {
     Running,
     Done,
     Error,
+    Stopped,
+    Overflow,
 }
 
 impl ResultStatus {
@@ -72,6 +74,8 @@ impl ResultStatus {
             Self::Running => "running",
             Self::Done => "done",
             Self::Error => "error",
+            Self::Stopped => "stopped",
+            Self::Overflow => "overflow",
         }
     }
 
@@ -80,6 +84,8 @@ impl ResultStatus {
             "running" => Some(Self::Running),
             "done" => Some(Self::Done),
             "error" => Some(Self::Error),
+            "stopped" => Some(Self::Stopped),
+            "overflow" => Some(Self::Overflow),
             _ => None,
         }
     }
@@ -130,6 +136,8 @@ pub struct ResultLine {
     pub line_type: String,
     #[serde(default)]
     pub result: Option<String>,
+    #[serde(default)]
+    pub session_id: Option<String>,
     #[serde(default)]
     pub message: Option<AssistantMessage>,
 }
