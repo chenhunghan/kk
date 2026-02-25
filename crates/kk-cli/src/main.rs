@@ -30,13 +30,30 @@ async fn main() -> Result<()> {
                 kk_config.agent_type = args[i + 1].clone();
                 i += 2;
             }
+            "--agent-bin" if i + 1 < args.len() => {
+                kk_config.agent_bin = args[i + 1].clone();
+                i += 2;
+            }
             _ => i += 1,
+        }
+    }
+
+    // Auto-detect kk-agent sibling (e.g. target/debug/kk-agent next to target/debug/kk).
+    // Falls back to PATH lookup if the sibling doesn't exist.
+    if kk_config.agent_bin == "kk-agent"
+        && let Ok(exe) = std::env::current_exe()
+        && let Some(dir) = exe.parent()
+    {
+        let sibling = dir.join("kk-agent");
+        if sibling.exists() {
+            kk_config.agent_bin = sibling.to_string_lossy().into_owned();
         }
     }
 
     info!(
         data_dir = kk_config.data_dir,
         agent = kk_config.agent_type,
+        agent_bin = kk_config.agent_bin,
         channels = kk_config.channels.len(),
         "starting kk"
     );
