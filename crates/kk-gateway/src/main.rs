@@ -49,12 +49,12 @@ async fn main() -> Result<()> {
 
     // File-based recovery (works in both modes)
     if let Err(e) = state.rebuild_active_jobs_from_files().await {
-        warn!(error = %e, "failed to rebuild activeJobs from status files");
+        warn!(error = %e, "failed to rebuild active_jobs from status files");
     }
 
     // Launcher-specific recovery (K8s recovers from Job labels)
     if let Err(e) = state.rebuild_active_jobs_from_launcher().await {
-        warn!(error = %e, "failed to rebuild activeJobs from launcher");
+        warn!(error = %e, "failed to rebuild active_jobs from launcher");
     }
 
     let shared = state.clone();

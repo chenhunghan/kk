@@ -68,7 +68,7 @@ mod tests {
         unsafe { std::env::set_var("AGENT_TYPE", "gemini") };
         let config = GatewayConfig::from_env();
         assert_eq!(config.agent_type, "gemini");
-        
+
         unsafe { std::env::set_var("AGENT_TYPE", "codex") };
         let config = GatewayConfig::from_env();
         assert_eq!(config.agent_type, "codex");

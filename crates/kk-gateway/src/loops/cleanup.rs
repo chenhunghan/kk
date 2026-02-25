@@ -35,7 +35,7 @@ pub async fn cleanup_once(state: &SharedState) -> Result<()> {
         warn!(error = %e, "launcher cleanup_finished error");
     }
 
-    // 2. Detect crashed agents (in activeJobs but launcher says gone)
+    // 2. Detect crashed agents (in active_jobs but launcher says gone)
     detect_crashed_jobs(state).await?;
 
     // 3. Handle orphaned group queue files
@@ -47,7 +47,7 @@ pub async fn cleanup_once(state: &SharedState) -> Result<()> {
     Ok(())
 }
 
-/// Detect agents tracked in activeJobs but no longer running in the launcher.
+/// Detect agents tracked in active_jobs but no longer running in the launcher.
 async fn detect_crashed_jobs(state: &SharedState) -> Result<()> {
     let actual_handles: HashSet<String> = state
         .launcher
@@ -75,7 +75,7 @@ async fn detect_crashed_jobs(state: &SharedState) -> Result<()> {
                 routing_key = key,
                 job = aj.job_name,
                 session_id = aj.session_id,
-                "detected crashed/missing agent, removing from activeJobs"
+                "detected crashed/missing agent, removing from active_jobs"
             );
 
             // Mark the result as error if status file exists and is still "running"

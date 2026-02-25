@@ -235,7 +235,7 @@ async fn cold_path(
         .await
         .with_context(|| format!("failed to launch agent {job_name}"))?;
 
-    // 4. Update activeJobs
+    // 4. Update active_jobs
     let mut active = state.active_jobs.write().await;
     active.insert(
         routing_key.to_string(),
