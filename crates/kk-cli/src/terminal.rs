@@ -325,6 +325,53 @@ fn render_logs(f: &mut Frame, app: &mut App, area: Rect) {
 // Message queueing + outbound polling
 // ---------------------------------------------------------------------------
 
+/// Archive any completed (non-running) terminal sessions before the results
+/// loop starts. Called synchronously in main before spawning loops.
+///
+/// Without this, restarting kk-cli after a killed session would cause the
+/// results loop to find a done session with no stream file (cleared by
+/// clear_channel_dirs) and fall back to the outbox — replaying a stale
+/// response in the fresh TUI.
+pub fn archive_orphaned_sessions(paths: &DataPaths) {
+    let results_root = paths.results_dir("");
+    let done_dir = paths.results_done_dir();
+    let _ = std::fs::create_dir_all(&done_dir);
+
+    let Ok(entries) = std::fs::read_dir(&results_root) else {
+        return;
+    };
+
+    for entry in entries.flatten() {
+        let dir_name = entry.file_name().to_string_lossy().to_string();
+        if dir_name.starts_with('.') {
+            continue;
+        }
+
+        // Leave running sessions alone.
+        let status = std::fs::read_to_string(paths.result_status(&dir_name)).unwrap_or_default();
+        if status.trim() == "running" {
+            continue;
+        }
+
+        // Only archive sessions that belong to this terminal channel.
+        let manifest_path = paths.request_manifest(&dir_name);
+        let Ok(raw) = std::fs::read_to_string(&manifest_path) else {
+            continue;
+        };
+        let Ok(val) = serde_json::from_str::<serde_json::Value>(&raw) else {
+            continue;
+        };
+        let channel = val.get("channel").and_then(|v| v.as_str()).unwrap_or("");
+        if channel != CHANNEL_NAME {
+            continue;
+        }
+
+        let src = paths.results_dir(&dir_name);
+        let dst = done_dir.join(&dir_name);
+        let _ = std::fs::rename(&src, &dst);
+    }
+}
+
 /// Clear the stream and outbox dirs for the terminal channel on startup.
 /// Both hold transient display state. A running kk-agent will re-populate
 /// the stream dir; outbox nq messages from a previous session are stale.

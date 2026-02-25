@@ -145,23 +145,28 @@ async fn main() -> Result<()> {
         }
     }
 
-    // 7. Run gateway loops in-process
+    // 7. Archive any completed terminal sessions left over from a previous
+    // (killed) run, before the results loop starts. Without this the loop
+    // would re-deliver their responses into the fresh TUI via the outbox.
+    terminal::archive_orphaned_sessions(&paths);
+
+    // 8. Run gateway loops in-process
     let inbound = tokio::spawn(loops::inbound::run(state.clone()));
     let results = tokio::spawn(loops::results::run(state.clone()));
     let cleanup = tokio::spawn(loops::cleanup::run(state.clone()));
     let state_reload = tokio::spawn(loops::state_reload::run(state.clone()));
 
-    // 8. Spawn connector watchdog (restarts crashed connectors)
+    // 9. Spawn connector watchdog (restarts crashed connectors)
     let watchdog = tokio::spawn(watch_connectors(
         connector_children,
         kk_config,
         paths.clone(),
     ));
 
-    // 9. Run TUI terminal connector in-process
+    // 10. Run TUI terminal connector in-process
     let terminal = tokio::spawn(terminal::run(paths, log_rx));
 
-    // 10. Wait for shutdown or crash
+    // 11. Wait for shutdown or crash
     tokio::select! {
         _ = tokio::signal::ctrl_c() => {
             info!("received Ctrl+C, shutting down");
