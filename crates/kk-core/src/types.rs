@@ -100,7 +100,11 @@ pub enum ChannelType {
     Slack,
     Discord,
     Github,
+    Teams,
+    Gchat,
+    Linear,
     Signal,
+    Terminal,
 }
 
 /// Group configuration from /data/state/groups.json (Protocol §6).

@@ -11,8 +11,11 @@ use kk_connector::outbound::{poll_outbound, poll_stream};
 use kk_connector::provider::ChatProvider;
 use kk_connector::provider::ConnectorEvent;
 use kk_connector::provider::discord::DiscordProvider;
+use kk_connector::provider::gchat::GchatProvider;
 use kk_connector::provider::github::GithubProvider;
+use kk_connector::provider::linear::LinearProvider;
 use kk_connector::provider::slack::SlackProvider;
+use kk_connector::provider::teams::TeamsProvider;
 use kk_connector::provider::telegram::TelegramProvider;
 use kk_connector::provider::whatsapp::WhatsappProvider;
 
@@ -151,8 +154,59 @@ async fn main() -> Result<()> {
 
             (handle, sender)
         }
+        "teams" => {
+            let app_id = config
+                .teams_app_id
+                .as_deref()
+                .context("TEAMS_APP_ID required for teams channel type")?;
+            let app_password = config
+                .teams_app_password
+                .as_deref()
+                .context("TEAMS_APP_PASSWORD required for teams channel type")?;
+
+            let teams = TeamsProvider::new(app_id, app_password, config.teams_webhook_port).await?;
+            info!(bot_app_id = teams.bot_app_id(), "bot identity");
+            let sender = Box::new(teams.sender());
+
+            let handle = tokio::spawn(async move {
+                teams.run_inbound(inbound_tx).await;
+            });
+
+            (handle, sender)
+        }
+        "gchat" => {
+            let token = config
+                .gchat_token
+                .as_deref()
+                .context("GCHAT_TOKEN required for gchat channel type")?;
+
+            let gchat = GchatProvider::new(token, config.gchat_webhook_port).await?;
+            let sender = Box::new(gchat.sender());
+
+            let handle = tokio::spawn(async move {
+                gchat.run_inbound(inbound_tx).await;
+            });
+
+            (handle, sender)
+        }
+        "linear" => {
+            let api_key = config
+                .linear_api_key
+                .as_deref()
+                .context("LINEAR_API_KEY required for linear channel type")?;
+
+            let linear = LinearProvider::new(api_key, config.linear_webhook_port).await?;
+            info!(bot_user_id = linear.bot_user_id(), "bot identity");
+            let sender = Box::new(linear.sender());
+
+            let handle = tokio::spawn(async move {
+                linear.run_inbound(inbound_tx).await;
+            });
+
+            (handle, sender)
+        }
         other => bail!(
-            "unsupported channel type: {other} (supported: telegram, slack, discord, github, whatsapp)"
+            "unsupported channel type: {other} (supported: telegram, slack, discord, github, whatsapp, teams, gchat, linear)"
         ),
     };
 

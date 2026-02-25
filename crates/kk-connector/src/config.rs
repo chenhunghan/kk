@@ -22,6 +22,13 @@ pub struct ConnectorConfig {
     pub whatsapp_phone_number_id: Option<String>,
     pub whatsapp_webhook_verify_token: Option<String>,
     pub whatsapp_webhook_port: u16,
+    pub teams_app_id: Option<String>,
+    pub teams_app_password: Option<String>,
+    pub teams_webhook_port: u16,
+    pub gchat_token: Option<String>,
+    pub gchat_webhook_port: u16,
+    pub linear_api_key: Option<String>,
+    pub linear_webhook_port: u16,
     pub outbound_poll_interval_ms: u64,
 }
 
@@ -66,6 +73,22 @@ impl ConnectorConfig {
                 .ok()
                 .and_then(|v| v.parse().ok())
                 .unwrap_or(8085),
+            teams_app_id: env::var("TEAMS_APP_ID").ok(),
+            teams_app_password: env::var("TEAMS_APP_PASSWORD").ok(),
+            teams_webhook_port: env::var("TEAMS_WEBHOOK_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8086),
+            gchat_token: env::var("GCHAT_TOKEN").ok(),
+            gchat_webhook_port: env::var("GCHAT_WEBHOOK_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8087),
+            linear_api_key: env::var("LINEAR_API_KEY").ok(),
+            linear_webhook_port: env::var("LINEAR_WEBHOOK_PORT")
+                .ok()
+                .and_then(|v| v.parse().ok())
+                .unwrap_or(8088),
             outbound_poll_interval_ms: env::var("OUTBOUND_POLL_INTERVAL_MS")
                 .ok()
                 .and_then(|v| v.parse().ok())
@@ -81,6 +104,9 @@ impl ConnectorConfig {
             "discord" => ChannelType::Discord,
             "github" => ChannelType::Github,
             "whatsapp" => ChannelType::Whatsapp,
+            "teams" => ChannelType::Teams,
+            "gchat" => ChannelType::Gchat,
+            "linear" => ChannelType::Linear,
             other => panic!("unsupported channel type: {other}"),
         }
     }
@@ -93,6 +119,9 @@ impl ConnectorConfig {
             "discord" => "discord",
             "github" => "gh",
             "whatsapp" => "wa",
+            "teams" => "teams",
+            "gchat" => "gchat",
+            "linear" => "linear",
             _ => "ch",
         }
     }

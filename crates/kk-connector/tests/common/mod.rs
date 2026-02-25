@@ -76,6 +76,13 @@ impl TestHarness {
             whatsapp_phone_number_id: None,
             whatsapp_webhook_verify_token: None,
             whatsapp_webhook_port: 8085,
+            teams_app_id: None,
+            teams_app_password: None,
+            teams_webhook_port: 8086,
+            gchat_token: None,
+            gchat_webhook_port: 8087,
+            linear_api_key: None,
+            linear_webhook_port: 8088,
             outbound_poll_interval_ms: 1_000,
         };
 

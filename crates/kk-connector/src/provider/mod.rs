@@ -1,6 +1,9 @@
 pub mod discord;
+pub mod gchat;
 pub mod github;
+pub mod linear;
 pub mod slack;
+pub mod teams;
 pub mod telegram;
 pub mod whatsapp;
 
