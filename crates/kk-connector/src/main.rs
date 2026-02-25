@@ -1,15 +1,14 @@
-mod config;
-mod platform;
-
-use anyhow::Result;
-use axum::{Router, routing::get};
+use anyhow::{Context, Result, bail};
+use tokio::sync::mpsc;
 use tokio::time::{Duration, sleep};
-use tracing::{error, info, warn};
+use tracing::{error, info};
 
-use kk_core::nq;
-use kk_core::types::OutboundMessage;
-
-use crate::config::ConnectorConfig;
+use kk_connector::config::ConnectorConfig;
+use kk_connector::groups::GroupMap;
+use kk_connector::inbound::process_inbound;
+use kk_connector::outbound::poll_outbound;
+use kk_connector::provider::ConnectorEvent;
+use kk_connector::provider::telegram::TelegramProvider;
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -26,25 +25,57 @@ async fn main() -> Result<()> {
     std::fs::create_dir_all(&config.inbound_dir)?;
     std::fs::create_dir_all(&config.outbox_dir)?;
 
-    let health_router = Router::new()
-        .route("/healthz", get(|| async { "ok" }))
-        .route("/readyz", get(|| async { "ok" }));
+    // Ensure groups.d parent directory exists
+    if let Some(parent) = std::path::Path::new(&config.groups_d_file).parent() {
+        std::fs::create_dir_all(parent)?;
+    }
 
-    let health_server = tokio::spawn(async move {
-        let listener = tokio::net::TcpListener::bind("0.0.0.0:8083").await.unwrap();
-        axum::serve(listener, health_router).await.unwrap();
+    // Only Telegram is supported for now
+    if config.channel_type != "telegram" {
+        bail!(
+            "unsupported channel type: {} (only 'telegram' is implemented)",
+            config.channel_type
+        );
+    }
+
+    let token = config
+        .telegram_bot_token
+        .as_deref()
+        .context("TELEGRAM_BOT_TOKEN required for telegram channel type")?;
+
+    let telegram = TelegramProvider::new(token).await?;
+    let bot = telegram.bot();
+    info!(bot_username = telegram.bot_username(), "bot identity");
+
+    // Load initial group mapping from groups.d/{channel}.json
+    let group_map = GroupMap::load(&config.groups_d_file, &config.channel_name);
+
+    // Channel for inbound events from teloxide dispatcher to processor
+    let (inbound_tx, inbound_rx) = mpsc::channel::<ConnectorEvent>(256);
+
+    // 1. Teloxide inbound dispatcher
+    let inbound_handle = tokio::spawn(async move {
+        telegram.run_inbound(inbound_tx).await;
     });
 
-    // TODO: Initialize platform client based on channel_type
-    // let platform = platform::create(&config).await?;
+    // 2. Inbound processor: receives ConnectorEvent, normalizes, writes to /data/inbound/
+    let inbound_config = config.clone();
+    let processor_handle = tokio::spawn(async move {
+        process_inbound(inbound_rx, &inbound_config, group_map).await;
+    });
 
-    // Outbound loop: poll outbox, send via platform
-    let outbox_dir = config.outbox_dir.clone();
-    let channel_name = config.channel_name.clone();
+    // 3. Outbound poller: polls /data/outbox/{channel}/, sends via Telegram
+    let outbound_config = config.clone();
     let outbound_handle = tokio::spawn(async move {
-        let interval = Duration::from_millis(1000); // Protocol §7: 1s for outbound
+        let interval = Duration::from_millis(outbound_config.outbound_poll_interval_ms);
         loop {
-            if let Err(e) = poll_outbound(&outbox_dir, &channel_name).await {
+            if let Err(e) = poll_outbound(
+                &outbound_config.outbox_dir,
+                &outbound_config.channel_name,
+                &bot,
+            )
+            .await
+            {
                 error!(error = %e, "outbound poll error");
             }
             sleep(interval).await;
@@ -54,54 +85,9 @@ async fn main() -> Result<()> {
     info!("connector loops started");
 
     tokio::select! {
-        res = outbound_handle => { res?; }
-        res = health_server => { res?; }
-    }
-
-    Ok(())
-}
-
-async fn poll_outbound(outbox_dir: &str, channel_name: &str) -> Result<()> {
-    let dir = std::path::Path::new(outbox_dir);
-    let files = nq::list_pending(dir)?;
-
-    for file_path in files {
-        let raw = match nq::read_message(&file_path) {
-            Ok(data) => data,
-            Err(e) => {
-                warn!(file = %file_path.display(), error = %e, "failed to read outbound message");
-                continue;
-            }
-        };
-
-        let msg: OutboundMessage = match serde_json::from_slice(&raw) {
-            Ok(m) => m,
-            Err(e) => {
-                error!(file = %file_path.display(), error = %e, "malformed outbound message, discarding");
-                let _ = nq::delete(&file_path);
-                continue;
-            }
-        };
-
-        if msg.channel != channel_name {
-            error!(
-                expected = channel_name,
-                got = msg.channel,
-                "outbound channel mismatch, discarding"
-            );
-            let _ = nq::delete(&file_path);
-            continue;
-        }
-
-        // TODO: send via platform
-        // platform.send(&msg).await?;
-
-        info!(
-            group = msg.group,
-            text_len = msg.text.len(),
-            "sent outbound message"
-        );
-        let _ = nq::delete(&file_path);
+        res = inbound_handle => { error!("inbound dispatcher exited"); res?; }
+        res = processor_handle => { error!("inbound processor exited"); res?; }
+        res = outbound_handle => { error!("outbound poller exited"); res?; }
     }
 
     Ok(())

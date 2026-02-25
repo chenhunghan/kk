@@ -25,6 +25,17 @@ impl DataPaths {
         self.root.join("groups").join(group)
     }
 
+    /// Thread-aware group queue directory.
+    /// - `None` → `/data/groups/{group}/`
+    /// - `Some("42")` → `/data/groups/{group}/threads/42/`
+    pub fn group_queue_dir_threaded(&self, group: &str, thread_id: Option<&str>) -> PathBuf {
+        let base = self.group_queue_dir(group);
+        match thread_id {
+            Some(tid) => base.join("threads").join(tid),
+            None => base,
+        }
+    }
+
     /// /data/outbox/{channel}/ — Gateway writes, Connectors read
     pub fn outbox_dir(&self, channel: &str) -> PathBuf {
         self.root.join("outbox").join(channel)
@@ -76,6 +87,17 @@ impl DataPaths {
         self.root.join("sessions").join(group)
     }
 
+    /// Thread-aware session directory.
+    /// - `None` → `/data/sessions/{group}/`
+    /// - `Some("42")` → `/data/sessions/{group}/threads/42/`
+    pub fn session_dir_threaded(&self, group: &str, thread_id: Option<&str>) -> PathBuf {
+        let base = self.session_dir(group);
+        match thread_id {
+            Some(tid) => base.join("threads").join(tid),
+            None => base,
+        }
+    }
+
     // --- Memory ---
 
     /// /data/memory/SOUL.md
@@ -95,6 +117,11 @@ impl DataPaths {
         self.root.join("state").join("groups.json")
     }
 
+    /// /data/state/groups.d/
+    pub fn groups_d_dir(&self) -> PathBuf {
+        self.root.join("state").join("groups.d")
+    }
+
     /// /data/state/cursors.json
     pub fn cursors_json(&self) -> PathBuf {
         self.root.join("state").join("cursors.json")
@@ -112,6 +139,7 @@ impl DataPaths {
             self.root.join("sessions"),
             self.root.join("memory"),
             self.root.join("state"),
+            self.root.join("state").join("groups.d"),
         ];
         for dir in &dirs {
             std::fs::create_dir_all(dir)?;
@@ -120,9 +148,19 @@ impl DataPaths {
     }
 }
 
-/// Build a session ID from group name and timestamp (Protocol §5.1)
+/// Build a session ID from group slug and timestamp (Protocol §5.1)
 pub fn session_id(group: &str, timestamp: u64) -> String {
     format!("{group}-{timestamp}")
+}
+
+/// Thread-aware session ID (Protocol §5.1).
+/// - `None` → `{group}-{timestamp}`
+/// - `Some("42")` → `{group}-t42-{timestamp}`
+pub fn session_id_threaded(group: &str, thread_id: Option<&str>, timestamp: u64) -> String {
+    match thread_id {
+        Some(tid) => format!("{group}-t{tid}-{timestamp}"),
+        None => session_id(group, timestamp),
+    }
 }
 
 /// Build a K8s Job name from session ID
@@ -217,6 +255,49 @@ mod tests {
         assert_eq!(
             paths.result_status("family-chat-1234"),
             PathBuf::from("/data/results/family-chat-1234/status")
+        );
+    }
+
+    #[test]
+    fn test_group_queue_dir_threaded() {
+        let paths = DataPaths::new("/data");
+        assert_eq!(
+            paths.group_queue_dir_threaded("dev-team", None),
+            PathBuf::from("/data/groups/dev-team")
+        );
+        assert_eq!(
+            paths.group_queue_dir_threaded("dev-team", Some("42")),
+            PathBuf::from("/data/groups/dev-team/threads/42")
+        );
+    }
+
+    #[test]
+    fn test_session_dir_threaded() {
+        let paths = DataPaths::new("/data");
+        assert_eq!(
+            paths.session_dir_threaded("dev-team", None),
+            PathBuf::from("/data/sessions/dev-team")
+        );
+        assert_eq!(
+            paths.session_dir_threaded("dev-team", Some("42")),
+            PathBuf::from("/data/sessions/dev-team/threads/42")
+        );
+    }
+
+    #[test]
+    fn test_session_id_threaded() {
+        assert_eq!(
+            session_id_threaded("dev-team", None, 1708801290),
+            "dev-team-1708801290"
+        );
+        assert_eq!(
+            session_id_threaded("dev-team", Some("42"), 1708801290),
+            "dev-team-t42-1708801290"
+        );
+        // Slack-style string thread ID
+        assert_eq!(
+            session_id_threaded("eng", Some("1708801285.000050"), 1708801290),
+            "eng-t1708801285.000050-1708801290"
         );
     }
 }

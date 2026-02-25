@@ -21,7 +21,7 @@ The Gateway runs three concurrent loops:
 | **Results loop** | `/data/results/*/status` | 2s | Read completed results → write to outbox |
 | **Cleanup loop** | K8s Jobs API | 60s | Delete finished Jobs, handle stuck results |
 
-The Gateway has **no knowledge** of Skills, platform SDKs, or LLM APIs. It only knows about queues, groups, triggers, and K8s Jobs.
+The Gateway has **no knowledge** of Skills, provider SDKs, or LLM APIs. It only knows about queues, groups, triggers, and K8s Jobs.
 
 ---
 
@@ -74,7 +74,7 @@ Size:    ~80MB
    mkdir -p $DATA_DIR/results/.done
    mkdir -p $DATA_DIR/state
 4. Load state files:
-   a. groupsConfig = loadJsonFile($DATA_DIR/state/groups.json) || { groups: {} }
+   a. groupsConfig = loadMergedGroupsConfig($DATA_DIR/state/groups.d/*.json, $DATA_DIR/state/groups.json)
    b. cursors = loadJsonFile($DATA_DIR/state/cursors.json) || {}
 5. Build in-memory indexes:
    a. activeJobs = {}    # group → { jobName, sessionId, createdAt }
@@ -99,9 +99,10 @@ Size:    ~80MB
 The Gateway maintains in-memory state (not persisted beyond what's on disk):
 
 ```
-activeJobs: Map<groupName, {
+// Routing key: "group" when unthreaded, "group|thread_id" when threaded
+activeJobs: Map<routingKey, {
   jobName:    string,     // "agent-family-chat-1708801290"
-  sessionId:  string,     // "family-chat-1708801290"
+  sessionId:  string,     // "family-chat-1708801290" or "family-chat-t42-1708801290"
   createdAt:  number,     // Unix timestamp
 }>
 
@@ -213,11 +214,13 @@ routeMessage(msg):
     RETURN
 
   # ──────────────────────────────────────────
-  # STEP 2: Hot path vs cold path
+  # STEP 2: Hot path vs cold path (keyed by group + thread_id)
   # ──────────────────────────────────────────
 
-  IF group in activeJobs:
-    # HOT PATH — Job already running for this group
+  routingKey = msg.thread_id ? group + "|" + msg.thread_id : group
+
+  IF routingKey in activeJobs:
+    # HOT PATH — Job already running for this (group, thread) pair
     hotPath(msg, group)
   ELSE:
     # COLD PATH — create new Job
@@ -255,7 +258,8 @@ checkTrigger(text, groupConfig):
 ```
 coldPath(msg, group):
   timestamp = msg.timestamp
-  sessionId = group + "-" + timestamp                # Protocol §5.1
+  threadId  = msg.thread_id                          # Option<String>
+  sessionId = sessionIdThreaded(group, threadId, timestamp)  # Protocol §5.1
   jobName   = "agent-" + sessionId
 
   # Sanitize jobName for K8s (max 63 chars, lowercase, alphanumeric + hyphens)
@@ -272,8 +276,9 @@ coldPath(msg, group):
   requestManifest = {                                # Protocol §4.4
     channel:       msg.channel,
     group:         msg.group,
+    thread_id:     msg.thread_id,                    # omit if None
     sender:        msg.sender,
-    platform_meta: msg.platform_meta,
+    meta: msg.meta,
     messages: [
       {
         sender: msg.sender,
@@ -285,9 +290,10 @@ coldPath(msg, group):
   writeFileSync(resultsDir + "/request.json", JSON.stringify(requestManifest, null, 2))
 
   # ──────────────────────────────────────────
-  # 2. Ensure per-group queue directory exists
+  # 2. Ensure per-group (thread-aware) queue directory exists
   # ──────────────────────────────────────────
-  mkdirSync(DATA_DIR + "/groups/" + group, { recursive: true })
+  groupQueueDir = groupQueueDirThreaded(group, threadId)
+  mkdirSync(groupQueueDir, { recursive: true })
 
   # ──────────────────────────────────────────
   # 3. Strip trigger pattern from prompt text
@@ -298,13 +304,14 @@ coldPath(msg, group):
   # ──────────────────────────────────────────
   # 4. Create K8s Job
   # ──────────────────────────────────────────
-  jobSpec = buildJobSpec(jobName, sessionId, group, promptText, msg.channel)
+  jobSpec = buildJobSpec(jobName, sessionId, group, threadId, promptText, msg.channel)
   await k8sClient.createNamespacedJob(NAMESPACE, jobSpec)
 
   # ──────────────────────────────────────────
-  # 5. Update in-memory state
+  # 5. Update in-memory state (keyed by routing key)
   # ──────────────────────────────────────────
-  activeJobs[group] = {
+  routingKey = threadId ? group + "|" + threadId : group
+  activeJobs[routingKey] = {
     jobName:   jobName,
     sessionId: sessionId,
     createdAt: now()
@@ -316,7 +323,7 @@ coldPath(msg, group):
 ### Job Spec Builder
 
 ```
-buildJobSpec(jobName, sessionId, group, promptText, channel):
+buildJobSpec(jobName, sessionId, group, threadId, promptText, channel):
   RETURN {
     apiVersion: "batch/v1",
     kind: "Job",
@@ -348,6 +355,7 @@ buildJobSpec(jobName, sessionId, group, promptText, channel):
             env: [
               { name: "PROMPT",       value: promptText },
               { name: "GROUP",        value: group },
+              { name: "THREAD_ID",    value: threadId || "" },   # empty string if not threaded
               { name: "SESSION_ID",   value: sessionId },
               { name: "IDLE_TIMEOUT", value: String(JOB_IDLE_TIMEOUT) },
               { name: "MAX_TURNS",    value: String(JOB_MAX_TURNS) },
@@ -386,7 +394,8 @@ buildJobSpec(jobName, sessionId, group, promptText, channel):
 
 ```
 hotPath(msg, group):
-  jobInfo = activeJobs[group]
+  routingKey = msg.thread_id ? group + "|" + msg.thread_id : group
+  jobInfo = activeJobs[routingKey]
 
   log.info("HOT PATH: forwarding to running Job", {
     group,
@@ -402,13 +411,14 @@ hotPath(msg, group):
     text:          stripTrigger(msg.text, groupsConfig.groups[group]),
     timestamp:     msg.timestamp,
     channel:       msg.channel,
-    platform_meta: msg.platform_meta
+    thread_id:     msg.thread_id,                    # omit if None
+    meta: msg.meta
   }
 
   # ──────────────────────────────────────────
-  # 2. Atomic write to per-group queue
+  # 2. Atomic write to thread-aware group queue
   # ──────────────────────────────────────────
-  groupQueueDir = DATA_DIR + "/groups/" + group
+  groupQueueDir = groupQueueDirThreaded(group, msg.thread_id)
   json = JSON.stringify(followUp)
   id   = randomHex(6)
   tmp  = groupQueueDir + "/.tmp-" + id
@@ -546,8 +556,9 @@ processCompletedResult(dirName, resultDir):
   outbound = {
     channel:       request.channel,
     group:         request.group,
+    thread_id:     request.thread_id,                # omit if None
     text:          responseText,
-    platform_meta: buildReplyMeta(request.platform_meta)
+    meta: buildReplyMeta(request.meta)
   }
 
   # 4. Write to outbox
@@ -609,7 +620,7 @@ extractResponseText(jsonlPath):
 
 ```
 buildReplyMeta(originalMeta):
-  # Copy platform_meta and add reply threading hints
+  # Copy meta and add reply threading hints
   meta = { ...originalMeta }
 
   # Telegram: reply to the original message
@@ -653,8 +664,9 @@ processErrorResult(dirName, resultDir):
   outbound = {
     channel:       request.channel,
     group:         request.group,
+    thread_id:     request.thread_id,                # omit if None
     text:          errorText,
-    platform_meta: buildReplyMeta(request.platform_meta)
+    meta: buildReplyMeta(request.meta)
   }
 
   outboxDir = DATA_DIR + "/outbox/" + request.channel
@@ -789,8 +801,10 @@ rebuildActiveJobs():
   })
   for job in jobs.items:
     IF not jobIsFinished(job):
-      group = job.metadata.labels.group
-      activeJobs[group] = {
+      group    = job.metadata.labels.group
+      threadId = extractEnvVar(job, "THREAD_ID")     # empty string → None
+      routingKey = threadId ? group + "|" + threadId : group
+      activeJobs[routingKey] = {
         jobName:   job.metadata.name,
         sessionId: extractSessionId(job),    # from env var or label
         createdAt: Date.parse(job.metadata.creationTimestamp)
@@ -804,11 +818,22 @@ rebuildActiveJobs():
 stateReloadLoop():
   every 30000 ms:
     try:
-      newConfig = JSON.parse(readFileSync(DATA_DIR + "/state/groups.json", "utf8"))
-      groupsConfig = newConfig
-      log.debug("Reloaded groups.json", { groups: Object.keys(newConfig.groups).length })
+      # Load groups.d/*.json as base layer
+      mergedConfig = { groups: {} }
+      groupsDDir = DATA_DIR + "/state/groups.d"
+      IF exists(groupsDDir):
+        for file in readdirSync(groupsDDir).filter(f => f.endsWith(".json")):
+          partialConfig = JSON.parse(readFileSync(groupsDDir + "/" + file, "utf8"))
+          Object.assign(mergedConfig.groups, partialConfig.groups)
+
+      # Overlay admin-managed groups.json (admin entries win)
+      adminConfig = JSON.parse(readFileSync(DATA_DIR + "/state/groups.json", "utf8"))
+      Object.assign(mergedConfig.groups, adminConfig.groups)
+
+      groupsConfig = mergedConfig
+      log.debug("Reloaded merged groups config", { groups: Object.keys(mergedConfig.groups).length })
     catch error:
-      log.warn("Failed to reload groups.json", { error: error.message })
+      log.warn("Failed to reload groups config", { error: error.message })
       # Keep using previous config
 ```
 

@@ -7,10 +7,12 @@ pub struct InboundMessage {
     pub channel: String,
     pub channel_type: ChannelType,
     pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub sender: String,
     pub text: String,
     pub timestamp: u64,
-    pub platform_meta: serde_json::Value,
+    pub meta: serde_json::Value,
 }
 
 /// Outbound message written by Gateway to /data/outbox/{channel}/ (Protocol §4.2)
@@ -18,8 +20,10 @@ pub struct InboundMessage {
 pub struct OutboundMessage {
     pub channel: String,
     pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub text: String,
-    pub platform_meta: serde_json::Value,
+    pub meta: serde_json::Value,
 }
 
 /// Follow-up message written by Gateway to /data/groups/{group}/ (Protocol §4.3)
@@ -29,7 +33,9 @@ pub struct FollowUpMessage {
     pub text: String,
     pub timestamp: u64,
     pub channel: String,
-    pub platform_meta: serde_json::Value,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
+    pub meta: serde_json::Value,
 }
 
 /// Request manifest written by Gateway to /data/results/{session-id}/request.json (Protocol §4.4)
@@ -37,8 +43,10 @@ pub struct FollowUpMessage {
 pub struct RequestManifest {
     pub channel: String,
     pub group: String,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub thread_id: Option<String>,
     pub sender: String,
-    pub platform_meta: serde_json::Value,
+    pub meta: serde_json::Value,
     pub messages: Vec<RequestMessage>,
 }
 
@@ -88,8 +96,9 @@ pub enum ChannelType {
     Signal,
 }
 
-/// Group configuration from /data/state/groups.json (Protocol §6)
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// Group configuration from /data/state/groups.json (Protocol §6).
+/// Keys are group slugs (`[a-z0-9-]+`, e.g. `family-chat`).
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 pub struct GroupsConfig {
     pub groups: HashMap<String, GroupEntry>,
 }
@@ -111,7 +120,7 @@ pub enum TriggerMode {
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ChannelMapping {
-    pub platform_group_id: String,
+    pub chat_id: String,
 }
 
 /// JSONL result line from Agent Job (Protocol §4.6)

@@ -16,10 +16,20 @@ This document is the single source of truth for how all KubeClaw components comm
 All inter-component communication happens via **files on a single shared RWX PVC** (`kubeclaw-data`), mounted at `/data` in every pod.
 
 There are **no network calls** between components (no HTTP, no gRPC, no TCP sockets). The only network calls are:
-- Connectors ↔ external platforms (Telegram API, WhatsApp WebSocket, etc.)
+- Connectors ↔ external providers (Telegram API, WhatsApp WebSocket, etc.)
 - Controller → GitHub (git clone for Skills)
 - Controller/Gateway → K8s API (managing CRs, Deployments, Jobs)
 - Agent → LLM API (Anthropic, Google, etc.)
+
+---
+
+## 1.1 Key Concepts
+
+**Group** — A group represents a single conversation context, mapped 1:1 to a provider chat (e.g. a Telegram group chat or DM). It is the unit of isolation in kk: each group gets its own agent job, its own follow-up queue (`/data/groups/{group}/`), and its own persistent session state (`/data/sessions/{group}/`). Messages from different groups never mix. A group is identified by its **slug** — a lowercase, hyphen-separated string matching `[a-z0-9-]+` (e.g. `family-chat`, `work-team`). The slug is mapped from the provider's numeric chat ID via `groups.json`. Messages from unmapped chat IDs are dropped with a warning. Throughout code and docs, the field `group` always holds this slug, never a display name or provider ID.
+
+**Thread** — A thread represents a sub-conversation within a group (e.g. a Telegram Forum Topic, Slack thread, or Discord thread). The routing key is `(group, thread_id)` — each pair gets its own agent job, follow-up queue, and session state. `thread_id` is `Option<String>` (`None` for non-threaded chats, string for threaded — Telegram uses integers-as-strings like `"42"`, Slack uses timestamps like `"1708801285.000050"`). Trigger config is per-group; all threads in a group share the same trigger pattern.
+
+**Channel** — A channel represents a single bot connection to a messaging provider (e.g. one Telegram bot). Each channel has its own Connector Deployment and its own outbox queue (`/data/outbox/{channel}/`). A group can span multiple channels (e.g. the same conversation bridged across Telegram and Slack), though typically it's one channel per group.
 
 ---
 
@@ -76,11 +86,13 @@ No separate done marker. Successful processing = file deleted. If a file persist
 ```
 /data/
 ├── inbound/                    WRITE: Connectors    READ: Gateway
-├── groups/{group-name}/        WRITE: Gateway       READ: Agent Jobs
+├── groups/{group}/        WRITE: Gateway       READ: Agent Jobs
+│   └── threads/{thread-id}/    WRITE: Gateway       READ: Agent Jobs (threaded)
 ├── outbox/{channel-name}/      WRITE: Gateway       READ: Connectors
 ├── results/{session-id}/       WRITE: Agent Jobs    READ: Gateway
 ├── skills/{skill-name}/        WRITE: Controller    READ: Agent Jobs
-├── sessions/{group-name}/      R+W:   Agent Jobs    (claude state)
+├── sessions/{group}/      R+W:   Agent Jobs    (claude state)
+│   └── threads/{thread-id}/    R+W:   Agent Jobs    (threaded sessions)
 ├── memory/                     R+W:   Human/Admin   READ: Agent Jobs
 └── state/                      R+W:   Gateway
 ```
@@ -112,17 +124,18 @@ No separate done marker. Successful processing = file deleted. If a file persist
   // Identity
   "channel": "telegram-bot-1",          // string — Channel CR metadata.name
   "channel_type": "telegram",           // string — Channel CR spec.type
-  "group": "family-chat",               // string — mapped group name (see §6)
+  "group": "family-chat",               // string — group slug (see §1.1, §6)
+  "thread_id": "42",                    // string? — thread/topic ID (omitted if not threaded)
   "sender": "John",                     // string — human-readable sender name
 
   // Content
   "text": "@Andy what's the weather?",  // string — message body (plain text)
 
   // Timing
-  "timestamp": 1708801290,              // int — Unix epoch seconds (from platform)
+  "timestamp": 1708801290,              // int — Unix epoch seconds (from provider)
 
   // Routing (opaque to Gateway — passed through to outbox for response)
-  "platform_meta": {
+  "meta": {
     // Telegram
     "chat_id": "-1001234567890",        // string — always stringified
     "message_id": 42,                   // int — for reply threading
@@ -142,10 +155,10 @@ No separate done marker. Successful processing = file deleted. If a file persist
 **Validation rules (Gateway enforces on read):**
 - `channel` — required, non-empty string
 - `channel_type` — required, one of: `telegram`, `whatsapp`, `slack`, `discord`, `signal`
-- `group` — required, non-empty string, slug format (`[a-z0-9-]+`)
+- `group` — required, non-empty string, group slug (`[a-z0-9-]+`, see §1.1)
 - `text` — required, non-empty string
 - `timestamp` — required, positive integer
-- `platform_meta` — required, object (contents are opaque)
+- `meta` — required, object (contents are opaque)
 
 ### 4.2 Outbound Message
 
@@ -156,8 +169,9 @@ No separate done marker. Successful processing = file deleted. If a file persist
 {
   "channel": "telegram-bot-1",          // string — which connector picks this up
   "group": "family-chat",               // string — for logging/debugging
+  "thread_id": "42",                    // string? — thread/topic ID (omitted if not threaded)
   "text": "The weather is 22°C.",       // string — response text to send
-  "platform_meta": {                    // object — passed through from inbound
+  "meta": {                    // object — passed through from inbound
     "chat_id": "-1001234567890",
     "reply_to_message_id": 42           // optional — for reply threading
   }
@@ -167,11 +181,11 @@ No separate done marker. Successful processing = file deleted. If a file persist
 **Validation rules (Connector enforces on read):**
 - `channel` — must match own `CHANNEL_NAME` env var
 - `text` — required, non-empty string
-- `platform_meta` — required, must contain platform-specific routing fields
+- `meta` — required, must contain provider-specific routing fields
 
 ### 4.3 Group Follow-up Message
 
-**Written by:** Gateway → `/data/groups/{group-name}/`
+**Written by:** Gateway → `/data/groups/{group}/`
 **Read by:** Running Agent Job for that group
 
 ```jsonc
@@ -180,7 +194,8 @@ No separate done marker. Successful processing = file deleted. If a file persist
   "text": "also check my calendar",     // string — follow-up message body
   "timestamp": 1708801300,              // int — Unix epoch seconds
   "channel": "telegram-bot-1",          // string — for context
-  "platform_meta": {                    // object — for response routing
+  "thread_id": "42",                    // string? — thread/topic ID (omitted if not threaded)
+  "meta": {                    // object — for response routing
     "chat_id": "-1001234567890",
     "message_id": 43
   }
@@ -198,8 +213,9 @@ Same format as inbound but used for hot-path delivery to an already-running Job.
 {
   "channel": "telegram-bot-1",          // string — where to send response
   "group": "family-chat",               // string — which group
+  "thread_id": "42",                    // string? — thread/topic ID (omitted if not threaded)
   "sender": "John",                     // string — who triggered the Job
-  "platform_meta": {                    // object — response routing info
+  "meta": {                    // object — response routing info
     "chat_id": "-1001234567890",
     "message_id": 42
   },
@@ -253,11 +269,17 @@ JSONL format (one JSON object per line). This is the raw output from `claude --o
 
 ### 5.1 Session ID Format
 
+Non-threaded:
 ```
-{group-name}-{unix-timestamp}
+{group}-{unix-timestamp}
 ```
-
 Examples: `family-chat-1708801290`, `work-team-1708801305`
+
+Threaded (when `thread_id` is present):
+```
+{group}-t{thread-id}-{unix-timestamp}
+```
+Examples: `dev-team-t42-1708801290`, `eng-t1708801285.000050-1708801290`
 
 Used in:
 - Job name: `agent-{session-id}` → `agent-family-chat-1708801290`
@@ -279,7 +301,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 ### 5.3 Session Directory Structure
 
 ```
-/data/sessions/{group-name}/
+/data/sessions/{group}/
 ├── .claude/                    ← Claude Code working directory
 │   ├── skills/                 ← symlinks to /data/skills/* (created by Agent Phase 0)
 │   │   ├── frontend-design → /data/skills/frontend-design
@@ -298,7 +320,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 ```
 /data/memory/
 ├── SOUL.md                     ← global personality (read by every Agent Job)
-├── {group-name}/
+├── {group}/
 │   └── CLAUDE.md               ← per-group context
 └── ...
 ```
@@ -307,7 +329,10 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 
 ```
 /data/state/
-├── groups.json                 ← group registry (see §6)
+├── groups.json                 ← group registry, admin-managed (see §6)
+├── groups.d/                   ← auto-registered groups (see §6)
+│   ├── telegram-bot-1.json     ← per-channel auto-registrations
+│   └── ...
 └── cursors.json                ← processing cursors (see §7)
 ```
 
@@ -317,7 +342,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 
 **File:** `/data/state/groups.json`
 **Owner:** Gateway (read + write)
-**Also read by:** Connectors (for group name mapping, read-only)
+**Also read by:** Connectors (for chat_id → group slug mapping, read-only)
 
 ```jsonc
 {
@@ -327,7 +352,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
       "trigger_mode": "mention",        // "mention" | "always" | "prefix"
       "channels": {                     // which channels map to this group
         "telegram-bot-1": {
-          "platform_group_id": "-1001234567890"   // platform-specific group ID
+          "chat_id": "-1001234567890"   // provider-specific group ID
         }
       }
     },
@@ -336,7 +361,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
       "trigger_mode": "mention",
       "channels": {
         "slack-eng": {
-          "platform_group_id": "C0123456789"
+          "chat_id": "C0123456789"
         }
       }
     },
@@ -345,7 +370,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
       "trigger_mode": "always",
       "channels": {
         "whatsapp-main": {
-          "platform_group_id": "1234567890@s.whatsapp.net"
+          "chat_id": "1234567890@s.whatsapp.net"
         }
       }
     }
@@ -353,7 +378,15 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 }
 ```
 
-**How Connectors use it:** On startup, the Connector reads `groups.json` to build a reverse lookup map: `platform_group_id → group_name`. When a message arrives, the Connector looks up the platform's chat/channel ID to determine the `group` field for the inbound message.
+### Auto-Registration via groups.d/
+
+Connectors auto-register unknown chats by writing to `/data/state/groups.d/{channel-name}.json`. Each Connector instance writes only its own file, avoiding concurrent writer conflicts.
+
+**Auto-generated slug format:** `tg-{abs(chat_id)}` — strips leading `-` from Telegram supergroup IDs. E.g. `-1001234567890` → `tg-1001234567890`. Default trigger mode: `mention`.
+
+**How Connectors use it:** On startup, the Connector loads its `groups.d/{channel}.json` to build a reverse lookup map: `chat_id → group slug`. When a message arrives from an unmapped chat_id, the Connector auto-registers it (writes to `groups.d/`) and processes the message. The config is reloaded every 30s.
+
+**How Gateway uses it:** The Gateway merges all `groups.d/*.json` files with its own `groups.json` to discover both auto-registered and admin-configured groups. See the Gateway plan for merge details.
 
 **How Gateway uses it:** When processing an inbound message, the Gateway reads the `trigger_pattern` and `trigger_mode` for the message's `group` to decide whether to act on it.
 
@@ -383,7 +416,7 @@ This avoids collisions if two CRs reference skills with the same frontmatter nam
 
 ```
 T+0.0s   User sends message
-T+0.0s   Connector receives from platform (WebSocket/long-poll)
+T+0.0s   Connector receives from provider (WebSocket/long-poll)
 T+0.1s   Connector writes to /data/inbound/
 T+2.0s   Gateway polls inbound (worst case: just missed the 2s window)
 T+2.1s   Gateway creates K8s Job
@@ -395,7 +428,7 @@ T+8.1s   Agent writes response.jsonl + status=done
 T+10.0s  Gateway polls results (worst case: just missed 2s window)
 T+10.1s  Gateway writes to /data/outbox/{channel}/
 T+11.0s  Connector polls outbox (worst case: just missed 1s window)
-T+11.1s  Connector sends via platform API
+T+11.1s  Connector sends via provider API
 T+11.2s  User sees response
 ```
 
@@ -486,7 +519,7 @@ The only potential race is if Gateway creates a Job at the exact moment a previo
 | Who detects | What | Action |
 |---|---|---|
 | Gateway | Inbound message fails validation (§4.1) | Log warning, delete file, skip. Do not create Job. |
-| Connector | Outbound message missing platform_meta fields | Log error, delete file, skip. Message is lost. |
+| Connector | Outbound message missing meta fields | Log error, delete file, skip. Message is lost. |
 | Agent | Follow-up message malformed | Log warning, skip, continue polling. |
 
 ### Stuck Files

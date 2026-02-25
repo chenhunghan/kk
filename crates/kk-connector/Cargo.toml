@@ -15,6 +15,15 @@ serde = { workspace = true }
 serde_json = { workspace = true }
 tracing = { workspace = true }
 tracing-subscriber = { workspace = true }
-axum = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+teloxide = { workspace = true }
+url = { workspace = true }
+chrono = { workspace = true }
+
+[lib]
+name = "kk_connector"
+path = "src/lib.rs"
+
+[dev-dependencies]
+tempfile = "3"

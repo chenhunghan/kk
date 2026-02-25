@@ -2,7 +2,7 @@ use kube::CustomResource;
 use schemars::JsonSchema;
 use serde::{Deserialize, Serialize};
 
-/// Channel CRD — declares a messaging platform connection.
+/// Channel CRD — declares a messaging provider connection.
 /// The Controller creates a Connector Deployment for each Channel.
 #[derive(CustomResource, Debug, Clone, Serialize, Deserialize, PartialEq, JsonSchema)]
 #[kube(
@@ -14,15 +14,15 @@ use serde::{Deserialize, Serialize};
     namespaced
 )]
 pub struct ChannelSpec {
-    /// Platform type: telegram, whatsapp, slack, discord, signal
+    /// Provider type: telegram, whatsapp, slack, discord, signal
     #[serde(rename = "type")]
     pub channel_type: String,
 
-    /// Name of the K8s Secret containing platform credentials
+    /// Name of the K8s Secret containing provider credentials
     #[serde(rename = "secretRef")]
     pub secret_ref: String,
 
-    /// Optional platform-specific configuration
+    /// Optional provider-specific configuration
     #[serde(default)]
     pub config: Option<serde_json::Value>,
 }

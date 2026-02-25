@@ -57,7 +57,7 @@ Set by the Gateway when creating the Job (see [Gateway Plan](plan-gateway.md) �
 | Var | Example | Description |
 |---|---|---|
 | `PROMPT` | `what's the weather?` | Initial prompt text (trigger pattern already stripped) |
-| `GROUP` | `family-chat` | Group name — determines session dir and follow-up queue |
+| `GROUP` | `family-chat` | Group slug — determines session dir and follow-up queue |
 | `SESSION_ID` | `family-chat-1708801290` | Unique session ID — determines results dir |
 | `IDLE_TIMEOUT` | `120` | Seconds to wait for follow-ups before exiting Phase 2 |
 | `MAX_TURNS` | `25` | Max agentic turns for `claude -p` |
@@ -485,7 +485,7 @@ The Agent reads follow-up messages from the per-group queue (Protocol §4.3):
   "text": "also check my calendar",
   "timestamp": 1708801300,
   "channel": "telegram-bot-1",
-  "platform_meta": { ... }
+  "meta": { ... }
 }
 ```
 
