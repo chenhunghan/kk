@@ -11,7 +11,7 @@
 
 ## Summary
 
-A **Provider** is an external messaging service (Telegram, Slack, WhatsApp, Discord, Signal). Each provider has a corresponding implementation in `provider/` (e.g. `TelegramProvider`) that handles API-specific inbound and outbound logic. The term "provider" is scoped to the Connector — other kk components don't interact with providers directly.
+A **Provider** is an external messaging service (Telegram, Slack, Discord, GitHub, WhatsApp, Teams, Google Chat, Linear). Each provider has a corresponding implementation in `provider/` (e.g. `TelegramProvider`) that handles API-specific inbound and outbound logic. The term "provider" is scoped to the Connector — other kk components don't interact with providers directly.
 
 A Connector is a single-replica Deployment created by the Controller (one per Channel CR). It bridges a provider to the internal nq file queues on the shared PVC. A single Rust binary handles all provider types — behavior is selected by the `CHANNEL_TYPE` env var.
 
@@ -55,12 +55,23 @@ Provider credentials come from the Secret via `envFrom`:
 |---|---|
 | Telegram | `TELEGRAM_BOT_TOKEN` |
 | Slack | `SLACK_BOT_TOKEN`, `SLACK_APP_TOKEN` |
+| Discord | `DISCORD_BOT_TOKEN` |
+| GitHub | `GITHUB_TOKEN` |
+| WhatsApp | `WHATSAPP_TOKEN`, `WHATSAPP_PHONE_NUMBER_ID`, `WHATSAPP_WEBHOOK_VERIFY_TOKEN` |
+| Teams | `TEAMS_APP_ID`, `TEAMS_APP_PASSWORD` |
+| Google Chat | `GCHAT_TOKEN` |
+| Linear | `LINEAR_API_KEY` |
 
 Tuning vars (optional):
 
 | Var | Default | Description |
 |---|---|---|
 | `OUTBOUND_POLL_INTERVAL_MS` | `1000` | Outbound queue poll interval |
+| `GITHUB_WEBHOOK_PORT` | `8084` | GitHub webhook server port |
+| `WHATSAPP_WEBHOOK_PORT` | `8085` | WhatsApp webhook server port |
+| `TEAMS_WEBHOOK_PORT` | `8086` | Teams webhook server port |
+| `GCHAT_WEBHOOK_PORT` | `8087` | Google Chat webhook server port |
+| `LINEAR_WEBHOOK_PORT` | `8088` | Linear webhook server port |
 
 ---
 
@@ -79,7 +90,13 @@ crates/kk-connector/
     └── provider/
         ├── mod.rs           ← InboundRaw, ConnectorEvent, ChatProvider trait
         ├── telegram.rs      ← TelegramProvider + TelegramOutbound (teloxide)
-        └── slack.rs         ← SlackProvider + SlackOutbound (Socket Mode + Web API + native streaming)
+        ├── slack.rs         ← SlackProvider + SlackOutbound (Socket Mode + Web API + native streaming)
+        ├── discord.rs       ← DiscordProvider + DiscordOutbound (Gateway + REST API)
+        ├── github.rs        ← GithubProvider + GithubOutbound (webhook + REST API)
+        ├── whatsapp.rs      ← WhatsappProvider + WhatsappOutbound (Cloud API webhook + REST API)
+        ├── teams.rs         ← TeamsProvider + TeamsOutbound (Bot Framework webhook + REST API)
+        ├── gchat.rs         ← GchatProvider + GchatOutbound (webhook + REST API)
+        └── linear.rs        ← LinearProvider + LinearOutbound (webhook + GraphQL API)
 ```
 
 Shared code in `kk-core`:
@@ -98,7 +115,7 @@ crates/kk-core/src/
 
 ```
 1. Read env vars via ConnectorConfig::from_env()
-2. Validate CHANNEL_TYPE is a supported provider (currently: "telegram", "slack")
+2. Validate CHANNEL_TYPE is a supported provider (`telegram`, `slack`, `discord`, `github`, `whatsapp`, `teams`, `gchat`, `linear`)
 3. Validate provider-specific credentials present
 4. Ensure directories: mkdir -p INBOUND_DIR, OUTBOX_DIR, STREAM_DIR, groups.d parent
 5. Initialize provider (e.g. TelegramProvider validates token via get_me())
@@ -145,14 +162,14 @@ pub struct GroupMap {
 impl GroupMap {
     pub fn load(groups_d_file: &str, channel_name: &str) -> Self;
     pub fn resolve(&self, chat_id: &str) -> Option<String>;
-    pub fn register(&mut self, chat_id: &str, channel_name: &str) -> String;
+    pub fn register(&mut self, chat_id: &str, slug_prefix: &str) -> String;
     pub fn persist(&self, groups_d_file: &str, channel_name: &str) -> Result<()>;
 }
 ```
 
 - **load**: Loads `groups.d/{channel}.json`, builds reverse map for this channel
 - **resolve**: Returns the mapped group slug, or `None` for unmapped chat IDs
-- **register**: Auto-registers unmapped chat_id → `tg-{abs(chat_id)}` slug, updates in-memory map
+- **register**: Auto-registers unmapped chat_id → `{prefix}-{chat_id}` slug (prefix from provider), updates in-memory map
 - **persist**: Atomically writes auto-registered mappings to `groups.d/{channel}.json`
 
 Owned by the inbound processor task (no shared locks needed).
@@ -167,7 +184,18 @@ When the bot encounters an unknown chat (no mapping in `groups.d/`), the Connect
 1. **Bot added to group** — provider notifies the Connector of a new group membership (e.g. Telegram `my_chat_member` update). Sends `ConnectorEvent::NewChat`.
 2. **Message in unmapped group** — A message arrives from a chat_id with no mapping. The inbound processor auto-registers before processing.
 
-**Slug format:** `tg-{abs(chat_id)}` — strips leading `-` from negative chat IDs. E.g. `-1001234567890` → `tg-1001234567890`.
+**Slug format:** provider-specific `{prefix}-{id}` (via `groups::auto_group_slug()`):
+
+| Provider | Prefix |
+|---|---|
+| Telegram | `tg-{abs(chat_id)}` (strips leading `-`) |
+| Slack | `slack-{chat_id}` (lowercased) |
+| Discord | `discord-{chat_id}` |
+| GitHub | `gh-{chat_id}` |
+| WhatsApp | `wa-{chat_id}` |
+| Teams | `teams-{chat_id}` |
+| Google Chat | `gchat-{chat_id}` |
+| Linear | `linear-{chat_id}` |
 
 **Persistence:** Auto-registered mappings are written to `/data/state/groups.d/{channel-name}.json` (atomic write via tmp+rename). Each Connector instance writes only its own file, avoiding concurrent writer conflicts. Default trigger mode for auto-registered groups is `mention`.
 
@@ -294,9 +322,10 @@ K8s sends SIGTERM, waits `terminationGracePeriodSeconds` (default 30s), then SIG
 | Crate | Purpose |
 |---|---|
 | `teloxide` 0.13 | Telegram provider (long-poll dispatcher) |
-| `reqwest` 0.12 | Slack Web API HTTP client |
-| `tokio-tungstenite` 0.26 | Slack Socket Mode WebSocket client |
+| `reqwest` 0.12 | Provider HTTP clients (Slack, Discord, GitHub, WhatsApp, Teams, Gchat, Linear) |
+| `tokio-tungstenite` 0.26 | WebSocket providers (Slack Socket Mode, Discord Gateway) |
 | `futures-util` 0.3 | Stream/Sink extensions for WebSocket |
+| `axum` 0.8 | Webhook servers (GitHub, WhatsApp, Teams, Gchat, Linear) |
 | `async-trait` 0.1 | `ChatProvider` trait with async methods |
 | `tokio` | Async runtime, mpsc channels, timers |
 | `serde` / `serde_json` | Message serialization |
@@ -338,7 +367,7 @@ SlackProvider::new(bot_token, app_token)
     └── .run_inbound()   → consumes self, runs Socket Mode
 ```
 
-The outbound loop uses `&dyn ChatProvider` for open extension — adding a new provider requires only `impl ChatProvider for MyOutbound`, no match arms to update.
+The outbound loops use `&dyn ChatProvider` for provider-agnostic dispatch. Adding a provider requires `impl ChatProvider for MyOutbound` and one bootstrap match arm in `main.rs`.
 
 ### Telegram (`provider/telegram.rs`)
 
@@ -390,9 +419,23 @@ Uses **Socket Mode** (WebSocket) for inbound — no HTTP server needed, connecti
 
 Auto-registration slug: `slack-{channel_id}` (e.g. `C0123456789` → `slack-c0123456789`).
 
+### Additional Providers
+
+The connector also includes first-party provider modules for:
+- `DiscordProvider` (`provider/discord.rs`) — Gateway WebSocket inbound + REST outbound/edit
+- `GithubProvider` (`provider/github.rs`) — webhook inbound for issue/PR events + comment create/edit
+- `WhatsappProvider` (`provider/whatsapp.rs`) — Cloud API webhook inbound + outbound send (no edit API)
+- `TeamsProvider` (`provider/teams.rs`) — Bot Framework inbound/outbound with OAuth token caching
+- `GchatProvider` (`provider/gchat.rs`) — Google Chat webhook inbound + REST create/edit
+- `LinearProvider` (`provider/linear.rs`) — webhook inbound + GraphQL comment create/edit
+
+Signal remains unimplemented in this crate (`ChannelType::Signal` exists in `kk-core` for forward compatibility).
+
 ---
 
 ## Testing Checklist
+
+Current automated E2E coverage in this repo is Telegram + Slack (`tests/e2e_telegram.rs`, `tests/e2e_slack.rs`). Additional provider E2E suites are pending.
 
 ### Inbound
 - [x] Message → `InboundMessage` written to `/data/inbound/`

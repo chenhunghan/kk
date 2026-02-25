@@ -658,7 +658,7 @@ Example log output:
 
 ## Tests
 
-The agent has 33 tests (15 unit + 18 integration), all passing.
+The agent has 34 tests (15 unit + 19 integration), all passing.
 
 Tests use a **mock claude binary** — a bash script that writes predictable JSONL to stdout and exits with a configurable code. The `CLAUDE_BIN` config field points to the mock.
 
@@ -712,6 +712,12 @@ Tests use a **mock claude binary** — a bash script that writes predictable JSO
 | `phase2_invalid_json_skipped` | Invalid JSON → skipped, file deleted, claude NOT called |
 | `phase2_idle_timeout` | No messages → exits after idle timeout |
 | `phase2_threaded_queue` | With thread_id=42 → polls thread-specific queue, non-threaded queue unaffected |
+
+**Phase 3 — Done:**
+
+| Test | Verifies |
+|---|---|
+| `phase3_status_done` | Final phase writes `status=done` when no early-stop/overflow path is taken |
 
 **E2E — Full Lifecycle:**
 

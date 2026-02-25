@@ -422,21 +422,20 @@ Structured JSON logs via `tracing` + `tracing-subscriber` (JSON format, level co
 - `test_parse_frontmatter_missing_closing` — rejects unclosed frontmatter
 - `test_parse_frontmatter_empty_name` — rejects empty name string
 
-### Integration Tests (require live K8s cluster)
+### Integration Tests (mock K8s client, no live cluster required)
 
 | Test | What it verifies |
 |---|---|
-| Create Channel CR → Connector Deployment created with correct env, labels, ownerRef | Channel reconciler |
-| Delete Channel CR → Connector Deployment garbage collected | ownerReferences |
-| Update Channel CR secretRef → Connector Deployment updated | Server-side apply |
-| Channel CR with non-existent Secret → status=Error | Secret validation |
-| Connector pod crashlooping → Channel status=Error with reason | Status detection |
-| Connector pod becomes ready → Channel status=Connected | Status detection |
-| Create Skill CR with valid source → files at `/data/skills/{name}/` | Skill reconciler |
-| Delete Skill CR → `/data/skills/{name}/` removed | Finalizer cleanup |
-| Invalid source format → status=Error | Source parsing |
-| Source points to non-existent repo → status=Error | Git clone error |
-| Git clone timeout → status=Error | Timeout handling |
-| SKILL.md missing from path → status=Error | File validation |
-| SKILL.md missing frontmatter name → status=Error | Frontmatter parsing |
-| Scripts in skill dir → executable permissions set | Permission handling |
+| `channel_deployment_ready_sets_connected` | Secret + ready Deployment => Channel phase `Connected` |
+| `channel_missing_secret_sets_error` | Missing Secret => phase `Error`, 30s requeue |
+| `channel_deployment_pending_sets_pending` | Not-ready Deployment => phase `Pending` |
+| `channel_deployment_crashloop_sets_error` | CrashLoopBackOff => phase `Error` |
+| `channel_config_merged_as_env_vars` | `spec.config` keys map to `CONFIG_*` env vars |
+| `channel_deployment_has_owner_ref` | Deployment ownerReference set to Channel CR |
+| `channel_creates_outbox_dir` | Connector outbox dir created on disk |
+| `skill_without_finalizer_adds_it` | Finalizer added via PATCH before apply flow |
+| `skill_invalid_source_sets_error_status` | Invalid source => phase `Error`, 300s requeue |
+| `skill_git_clone_failure_sets_error` | Git clone failure path surfaces error/status |
+| `skill_cleanup_on_delete` | Deletion removes skill dir and finalizer |
+
+These tests use `tests/mock_k8s.rs` (`tower::service_fn`) to emulate K8s API responses and record requests.

@@ -249,5 +249,5 @@ meta: serde_json::json!({
 ## Verification
 
 1. `cargo build` — all crates compile
-2. `cargo test` — all 142 tests pass (131 existing + 6 fallback streaming + 5 native streaming)
+2. `cargo test --workspace -- --list` — 153 tests discovered across workspace (including streaming tests)
 3. `cargo clippy` — no warnings

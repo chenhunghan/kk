@@ -6,7 +6,7 @@ A chronological record of everything built in the kk project, from first commit 
 
 ## What is kk?
 
-kk is a K8s-native system that bridges messaging platforms (Telegram, Slack, WhatsApp, Discord, Signal) to LLM agents via file-based queues on a shared RWX PVC. All inter-component communication is through files on disk — no network calls between components.
+kk is a K8s-native system that bridges messaging platforms (Telegram, Slack, Discord, GitHub, WhatsApp, Teams, Google Chat, Linear; Signal planned) to LLM agents via file-based queues on a shared RWX PVC. All inter-component communication is through files on disk — no network calls between components.
 
 **Language:** Rust monorepo
 **CRD API group:** `kk.io` (v1alpha1)
@@ -461,7 +461,7 @@ Added 11 integration tests for the controller using a mock `kube::Client` backed
 | kk-agent | Complete | 15 | — | 19 |
 | **Total** | | **88** | **11** | **54** |
 
-**Grand total: 153 tests, all passing.**
+**Grand total: 153 tests.**
 
 ### Plan Documents
 
@@ -482,6 +482,7 @@ Added 11 integration tests for the controller using a mock `kube::Client` backed
 - **CI/CD** — no GitHub Actions workflow yet
 - **Docker images** — no Dockerfiles
 - **K8s manifests** — documented in plan docs but not in repo as actual YAML
-- **WhatsApp, Discord, Signal connectors** — not yet implemented (ChatProvider trait ready)
+- **Signal connector** — `ChannelType::Signal` exists, but no `provider/signal.rs` implementation yet
+- **Non-Slack/Telegram provider E2E coverage** — Discord/GitHub/WhatsApp/Teams/Gchat/Linear need dedicated E2E suites
 - **Private repo skills** — optional `secretRef` field (deferred)
 - **Skill branch/tag pinning** — optional `ref` field (deferred)
