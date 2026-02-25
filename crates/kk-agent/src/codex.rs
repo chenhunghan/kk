@@ -6,14 +6,14 @@ use kk_core::types::ResultLine;
 
 use crate::agent::{CodeAgent, AgentResult};
 
-pub struct Claude;
+pub struct Codex;
 
-impl CodeAgent for Claude {
+impl CodeAgent for Codex {
     fn spawn(
         &self,
         bin: &str,
         prompt: &str,
-        max_turns: u32,
+        _max_turns: u32,
         session_dir: &Path,
         response_path: &Path,
         log_path: &Path,
@@ -24,19 +24,16 @@ impl CodeAgent for Claude {
             File::create(log_path).with_context(|| format!("create {}", log_path.display()))?;
 
         let status = Command::new(bin)
-            .arg("-p")
+            .arg("exec")
             .arg(prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--max-turns")
-            .arg(max_turns.to_string())
-            .arg("--verbose")
+            .arg("--json")
+            .arg("--dangerously-bypass-approvals-and-sandbox")
+            .arg("--skip-git-repo-check")
             .current_dir(session_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
             .status()
-            .with_context(|| format!("spawn {bin}"))?;
+            .with_context(|| format!("spawn {bin} exec"))?;
 
         Ok(AgentResult {
             exit_code: status.code().unwrap_or(1),
@@ -48,7 +45,7 @@ impl CodeAgent for Claude {
         bin: &str,
         prompt: &str,
         session_id: &str,
-        max_turns: u32,
+        _max_turns: u32,
         session_dir: &Path,
         response_path: &Path,
         log_path: &Path,
@@ -59,21 +56,18 @@ impl CodeAgent for Claude {
             File::create(log_path).with_context(|| format!("create {}", log_path.display()))?;
 
         let status = Command::new(bin)
-            .arg("-p")
-            .arg(prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--resume")
+            .arg("exec")
+            .arg("resume")
             .arg(session_id)
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--max-turns")
-            .arg(max_turns.to_string())
-            .arg("--verbose")
+            .arg(prompt)
+            .arg("--json")
+            .arg("--dangerously-bypass-approvals-and-sandbox")
+            .arg("--skip-git-repo-check")
             .current_dir(session_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
             .status()
-            .with_context(|| format!("spawn {bin} --resume {session_id}"))?;
+            .with_context(|| format!("spawn {bin} exec resume {session_id}"))?;
 
         Ok(AgentResult {
             exit_code: status.code().unwrap_or(1),
@@ -84,8 +78,8 @@ impl CodeAgent for Claude {
         &self,
         bin: &str,
         prompt: &str,
-        _session_id: Option<&str>,
-        max_turns: u32,
+        session_id: Option<&str>,
+        _max_turns: u32,
         session_dir: &Path,
         response_path: &Path,
         log_path: &Path,
@@ -101,21 +95,25 @@ impl CodeAgent for Claude {
             .open(log_path)
             .with_context(|| format!("open {} for append", log_path.display()))?;
 
-        let status = Command::new(bin)
-            .arg("-p")
+        let mut cmd = Command::new(bin);
+        cmd.arg("exec").arg("resume");
+        
+        if let Some(sid) = session_id {
+            cmd.arg(sid);
+        } else {
+            cmd.arg("--last");
+        }
+
+        let status = cmd
             .arg(prompt)
-            .arg("--dangerously-skip-permissions")
-            .arg("--resume")
-            .arg("--output-format")
-            .arg("stream-json")
-            .arg("--max-turns")
-            .arg(max_turns.to_string())
-            .arg("--verbose")
+            .arg("--json")
+            .arg("--dangerously-bypass-approvals-and-sandbox")
+            .arg("--skip-git-repo-check")
             .current_dir(session_dir)
             .stdout(stdout_file)
             .stderr(stderr_file)
             .status()
-            .with_context(|| format!("spawn {bin} --resume"))?;
+            .with_context(|| format!("spawn {bin} exec resume"))?;
 
         Ok(AgentResult {
             exit_code: status.code().unwrap_or(1),
@@ -159,6 +157,6 @@ impl CodeAgent for Claude {
     }
 
     fn skill_dir_name(&self) -> &str {
-        ".claude"
+        ".codex"
     }
 }

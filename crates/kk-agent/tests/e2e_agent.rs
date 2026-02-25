@@ -666,3 +666,72 @@ exit 0
     let status = fs::read_to_string(paths.result_status(&config.session_id)).unwrap();
     assert_eq!(status, "done");
 }
+
+#[test]
+fn e2e_codex_lifecycle() {
+    let tmp = tempfile::tempdir().unwrap();
+    let data_dir = tmp.path().join("data");
+    let paths = DataPaths::new(&data_dir);
+    paths.ensure_dirs().unwrap();
+
+    let bin_dir = tmp.path().join("bin");
+    fs::create_dir_all(&bin_dir).unwrap();
+    
+    // Create a mock codex binary
+    let script = bin_dir.join("mock-codex");
+    let content = r#"#!/bin/bash
+echo "$@" > .last-args
+echo '{"type":"result","result":"codex response","session_id":"codex-sess-123"}'
+exit 0
+"#;
+    fs::write(&script, content).unwrap();
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::PermissionsExt;
+        fs::set_permissions(&script, fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    let config = AgentConfig {
+        session_id: "test-codex-123".to_string(),
+        group: "test-group".to_string(),
+        data_dir: data_dir.to_string_lossy().into_owned(),
+        idle_timeout: 1,
+        max_turns: 5,
+        thread_id: None,
+        agent_type: kk_agent::config::AgentType::Codex,
+        agent_bin: script.to_string_lossy().into_owned(),
+    };
+
+    fs::create_dir_all(paths.results_dir(&config.session_id)).unwrap();
+    let session_dir = paths.session_dir_threaded(&config.group, config.thread_id.as_deref());
+    fs::create_dir_all(&session_dir).unwrap();
+
+    write_request_manifest(&paths, &config.session_id, &config.group, "codex prompt");
+
+    // Phase 0
+    phases::phase_0_skills(&config, &paths, &session_dir).unwrap();
+    assert!(session_dir.join(".codex/skills").exists());
+
+    // Phase 1
+    phases::phase_1_prompt(&config, &paths, &session_dir).unwrap();
+    
+    // Verify args
+    let args = fs::read_to_string(session_dir.join(".last-args")).unwrap();
+    assert!(args.contains("exec codex prompt"));
+    assert!(args.contains("--json"));
+    assert!(args.contains("--dangerously-bypass-approvals-and-sandbox"));
+
+    // Phase 2 (with follow-up)
+    let queue_dir = paths.group_queue_dir_threaded(&config.group, config.thread_id.as_deref());
+    enqueue_followup(&queue_dir, "Alice", "codex follow-up");
+    phases::phase_2_followups(&config, &paths, &session_dir).unwrap();
+
+    // Verify resume args
+    let args = fs::read_to_string(session_dir.join(".last-args")).unwrap();
+    assert!(args.contains("exec resume codex-sess-123 [Follow-up from Alice]: codex follow-up"));
+
+    // Phase 3
+    phases::phase_3_done(&paths, &config.session_id).unwrap();
+    let status = fs::read_to_string(paths.result_status(&config.session_id)).unwrap();
+    assert_eq!(status, "done");
+}

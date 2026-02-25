@@ -11,7 +11,7 @@
 
 ## Summary
 
-The Agent Job is an ephemeral K8s Job (one per invocation). It is created by the Gateway when a message triggers the cold path. The Job runs a single pod that executes a code agent CLI (e.g., `claude` or `gemini`), reads per-group context and skills, polls for follow-up messages, and writes results.
+The Agent Job is an ephemeral K8s Job (one per invocation). It is created by the Gateway when a message triggers the cold path. The Job runs a single pod that executes a code agent CLI (e.g., `claude`, `gemini`, or `codex`), reads per-group context and skills, polls for follow-up messages, and writes results.
 
 The Agent Job has **no knowledge** of the Gateway, Connectors, Channels, or the K8s API. It only interacts with the shared PVC via well-defined file paths.
 
@@ -45,6 +45,7 @@ crates/kk-agent/
     agent.rs        # CodeAgent trait definition
     claude.rs       # Claude implementation of CodeAgent
     gemini.rs       # Gemini implementation of CodeAgent
+    codex.rs        # Codex implementation of CodeAgent
     config.rs       # AgentConfig::from_env()
     phases.rs       # phase_0_skills, phase_1_prompt, phase_2_followups, phase_3_done
   tests/
@@ -109,7 +110,7 @@ Set by the Gateway when creating the Job (see [Gateway](kk-gateway.md) — Job S
 | `IDLE_TIMEOUT` | `120` | no (default `120`) | Seconds to wait for follow-ups before exiting Phase 2 |
 | `MAX_TURNS` | `25` | no (default `25`) | Max agentic turns for the agent |
 | `THREAD_ID` | `42` | no | Thread ID within group — enables thread-aware paths |
-| `AGENT_TYPE` | `claude` | no (default `claude`) | Agent type: `claude` or `gemini` |
+| `AGENT_TYPE` | `claude` | no (default `claude`) | Agent type: `claude`, `gemini`, or `codex` |
 | `AGENT_BIN` | `claude` | no | Path to agent binary (overridable for testing, defaults based on type) |
 | `CLAUDE_BIN` | `claude` | no | Legacy alias for `AGENT_BIN` |
 

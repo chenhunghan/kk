@@ -6,6 +6,7 @@ use crate::agent::CodeAgent;
 pub enum AgentType {
     Claude,
     Gemini,
+    Codex,
 }
 
 impl AgentType {
@@ -13,6 +14,7 @@ impl AgentType {
         match s.to_lowercase().as_str() {
             "claude" => Some(Self::Claude),
             "gemini" => Some(Self::Gemini),
+            "codex" => Some(Self::Codex),
             _ => None,
         }
     }
@@ -21,6 +23,7 @@ impl AgentType {
         match self {
             Self::Claude => "claude",
             Self::Gemini => "gemini",
+            Self::Codex => "codex",
         }
     }
 
@@ -28,6 +31,7 @@ impl AgentType {
         match self {
             Self::Claude => Box::new(crate::claude::Claude),
             Self::Gemini => Box::new(crate::gemini::Gemini),
+            Self::Codex => Box::new(crate::codex::Codex),
         }
     }
 }
@@ -67,6 +71,7 @@ impl AgentConfig {
             match agent_type {
                 AgentType::Claude => "claude".to_string(),
                 AgentType::Gemini => "gemini".to_string(),
+                AgentType::Codex => "codex".to_string(),
             }
         });
 
