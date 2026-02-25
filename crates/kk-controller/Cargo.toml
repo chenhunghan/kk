@@ -20,5 +20,14 @@ k8s-openapi = { workspace = true }
 axum = { workspace = true }
 anyhow = { workspace = true }
 thiserror = { workspace = true }
+# NOTE: serde_yaml is deprecated but kube-rs still depends on it transitively.
+# Revisit when kube-rs migrates (track: https://github.com/kube-rs/kube/issues).
+# Alternatives: serde-saphyr (active, 0.0.x), serde_yaml_ng (stale since 2024).
+serde_yaml = "0.9"
+chrono = { workspace = true }
 futures = "0.3"
 schemars = "0.8"
+
+[lib]
+name = "kk_controller"
+path = "src/lib.rs"

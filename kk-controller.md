@@ -22,18 +22,37 @@ The Controller has **no knowledge** of the Gateway, Agent Jobs, messages, or que
 
 ---
 
+## Implementation
+
+- **Crate:** `crates/kk-controller`
+- **Language:** Rust
+- **Key dependencies:** `kube` (kube-rs) v0.98, `k8s-openapi` v0.24, `tokio`, `axum`, `serde_yaml`
+
+### Source layout
+
+| File | Purpose |
+|---|---|
+| `src/lib.rs` | Exports `config`, `crd`, `reconcilers` modules |
+| `src/main.rs` | Loads config, ensures PVC dirs, starts health server + both reconcilers |
+| `src/config.rs` | `ControllerConfig::from_env()` |
+| `src/crd.rs` | `Channel` and `Skill` CRD definitions (`kk.io/v1alpha1`) |
+| `src/reconcilers/channel.rs` | Channel reconciler — builds Connector Deployments via server-side apply |
+| `src/reconcilers/skill.rs` | Skill reconciler — git clone, validate, copy to PVC, finalizer cleanup |
+
+---
+
 ## Image
 
 ```
 kk-controller:latest
 
-Base:   alpine:3.19 (or debian-slim)
+Base:   debian-slim (or alpine:3.19)
 Install: git, ca-certificates
-Runtime: Go binary (preferred) or Node.js
-Size:    ~50MB
+Runtime: Rust binary
+Size:    ~15MB (static Rust binary + git)
 ```
 
-`git` is required in the image for Skill cloning. The Controller shells out to `git clone` rather than using a git library — simpler, proven, and avoids CGO dependencies.
+`git` is required in the image for Skill cloning. The Controller shells out to `git clone` rather than using a git library — simpler, proven, and avoids additional dependencies.
 
 ---
 
@@ -43,35 +62,23 @@ Size:    ~50MB
 |---|---|---|
 | `IMAGE_CONNECTOR` | `kk-connector:latest` | Image used for Connector Deployments |
 | `DATA_DIR` | `/data` | PVC mount path |
-| `NAMESPACE` | Auto-detected (in-cluster) | Namespace to watch. Falls back to reading `/var/run/secrets/.../namespace` |
-| `RECONCILE_WORKERS` | `2` | Number of concurrent reconcile workers per CRD type |
+| `NAMESPACE` | Auto-detected (in-cluster) | Namespace to watch. Falls back to reading `/var/run/secrets/.../namespace`, then `default` |
 | `SKILL_CLONE_TIMEOUT` | `60` | Seconds before git clone is killed |
+| `PVC_CLAIM_NAME` | `kk-data` | Name of the PersistentVolumeClaim to mount in Connector Deployments |
 
 ---
 
 ## Startup Sequence
 
 ```
-1. Read env vars, validate required ones
-2. Build K8s client (in-cluster config via ServiceAccount token)
-3. Verify CRDs exist:
-   GET /apis/kk.io/v1alpha1 → must list "channels" and "skills"
-   If missing → log FATAL "CRDs not installed. Apply CRDs before starting controller." → exit 1
-4. Ensure PVC directories exist:
-   mkdir -p $DATA_DIR/skills
-5. Start shared informer factory with two informers:
-   a. Informer: channels.kk.io/v1alpha1
-      → onAdd/onUpdate/onDelete → enqueue to channelWorkQueue
-   b. Informer: skills.kk.io/v1alpha1
-      → onAdd/onUpdate/onDelete → enqueue to skillWorkQueue
-6. Wait for informer caches to sync (with 30s timeout)
-7. Start worker goroutines:
-   - RECONCILE_WORKERS goroutines reading from channelWorkQueue
-   - RECONCILE_WORKERS goroutines reading from skillWorkQueue
-8. Block on SIGTERM/SIGINT → graceful shutdown:
-   - Stop informers
-   - Drain work queues
-   - Exit 0
+1. Load ControllerConfig from env vars (with defaults)
+2. Ensure PVC directory structure exists:
+   DataPaths::ensure_dirs() → creates inbound/, outbox/, groups/, results/, skills/, sessions/, memory/, state/
+3. Build K8s client (in-cluster config via ServiceAccount token)
+4. Start health server on :8081 (/healthz, /readyz)
+5. Start Channel controller (kube-rs Controller with .owns(Deployments))
+6. Start Skill controller (kube-rs Controller with finalizer)
+7. Both controllers run concurrently via tokio::select!
 ```
 
 ---
@@ -80,149 +87,58 @@ Size:    ~50MB
 
 ### Trigger
 
-K8s informer fires on Channel CR create/update/delete → key (`namespace/name`) enqueued to channelWorkQueue.
+kube-rs `Controller::new(channels).owns(deployments)` — reconciles on Channel CR changes and child Deployment status changes.
 
 ### Logic
 
 ```
-channelReconcile(key):
-
-  channel = GET Channel CR by key from API server
-  
-  ┌──────────────────────────────────────────────────────┐
-  │ CASE 1: Channel CR was deleted (channel == nil)      │
-  │──────────────────────────────────────────────────────│
-  │ Nothing to do.                                       │
-  │ ownerReferences on the Connector Deployment cause    │
-  │ K8s garbage collector to delete it automatically.    │
-  │                                                      │
-  │ Optional: clean up /data/outbox/{channel-name}/      │
-  │ (stale outbox dir). Not critical — Connector is gone │
-  │ so nobody reads it.                                  │
-  └──────────────────────────────────────────────────────┘
-
-  ┌──────────────────────────────────────────────────────┐
-  │ CASE 2: Channel CR exists (create or update)         │
-  └──────────────────────────────────────────────────────┘
+reconcile(channel):
 
   # 1. Validate secretRef exists
   secret = GET Secret channel.spec.secretRef in channel.namespace
-  IF secret == nil:
+  IF secret == 404:
     UPDATE channel.status:
       phase: "Error"
       message: "Secret '{secretRef}' not found"
     RETURN (requeue after 30s — secret might be created later)
 
   # 2. Build desired Connector Deployment
-  desired = {
-    metadata:
-      name:       "connector-" + channel.metadata.name
-      namespace:  channel.metadata.namespace
-      labels:
-        app:           "kk-connector"
-        channel:       channel.metadata.name
-        channel-type:  channel.spec.type
-      ownerReferences:
-        - apiVersion:          "kk.io/v1alpha1"
-          kind:                "Channel"
-          name:                channel.metadata.name
-          uid:                 channel.metadata.uid
-          controller:          true
-          blockOwnerDeletion:  true
+  desired = build_connector_deployment(channel, config)
+  #   → name: "connector-{channel.name}"
+  #   → labels: app=kk-connector, channel={name}, channel-type={type}
+  #   → ownerReferences: Channel CR (controller=true, blockOwnerDeletion=true)
+  #   → container env: CHANNEL_TYPE, CHANNEL_NAME, INBOUND_DIR, OUTBOX_DIR, GROUPS_D_FILE
+  #   → envFrom: secretRef from channel.spec.secretRef
+  #   → channel.spec.config keys merged as CONFIG_{UPPER_SNAKE(key)} env vars
+  #   → PVC volume mount at $DATA_DIR (claimName from PVC_CLAIM_NAME)
 
-    spec:
-      replicas: 1
-      selector:
-        matchLabels:
-          app:      "kk-connector"
-          channel:  channel.metadata.name
-      template:
-        metadata:
-          labels:
-            app:           "kk-connector"
-            channel:       channel.metadata.name
-            channel-type:  channel.spec.type
-        spec:
-          containers:
-          - name: connector
-            image: $IMAGE_CONNECTOR
-            env:
-            - name:  CHANNEL_TYPE
-              value: channel.spec.type
-            - name:  CHANNEL_NAME
-              value: channel.metadata.name
-            - name:  INBOUND_DIR
-              value: $DATA_DIR + "/inbound"
-            - name:  OUTBOX_DIR
-              value: $DATA_DIR + "/outbox/" + channel.metadata.name
-            envFrom:
-            - secretRef:
-                name: channel.spec.secretRef
-            volumeMounts:
-            - name:      data
-              mountPath: /data
-          volumes:
-          - name: data
-            persistentVolumeClaim:
-              claimName: kk-data
-  }
-
-  # Merge channel.spec.config into connector env if present
-  IF channel.spec.config != nil:
-    for key, value in channel.spec.config:
-      add env var: CONFIG_{UPPER_SNAKE(key)} = JSON.stringify(value)
-      # e.g. allowedChatIds → CONFIG_ALLOWED_CHAT_IDS = '["-1001234567890"]'
-
-  # 3. Apply Deployment
-  existing = GET Deployment "connector-" + channel.metadata.name
-  IF existing == nil:
-    CREATE Deployment desired
-    log.Info("Created connector deployment", "channel", channel.metadata.name)
-  ELSE:
-    IF specChanged(existing, desired):
-      UPDATE Deployment with desired spec
-      log.Info("Updated connector deployment", "channel", channel.metadata.name)
+  # 3. Server-side apply (no manual diff needed)
+  applied = PATCH Deployment with Patch::Apply, field manager "kk-controller", force=true
 
   # 4. Ensure outbox directory exists
-  mkdir -p $DATA_DIR/outbox/channel.metadata.name
+  mkdir -p $DATA_DIR/outbox/{channel.name}
 
   # 5. Update status based on Deployment readiness
-  deployment = GET Deployment "connector-" + channel.metadata.name
-  pods = LIST Pods with label channel=channel.metadata.name
-
-  IF deployment.status.readyReplicas >= 1:
-    UPDATE channel.status:
-      phase: "Connected"
-      connectorPod: pods[0].metadata.name
-      message: ""
-
-  ELSE IF pods exist AND pods[0].status has waiting reason "CrashLoopBackOff":
-    UPDATE channel.status:
-      phase: "Error"
-      message: "Connector crashlooping: " + pods[0].status.containerStatuses[0].state.waiting.message
-
+  IF applied.status.readyReplicas >= 1:
+    phase: "Connected", message: "Connector running"
+  ELSE IF Deployment condition Available=False with CrashLoopBackOff/Error:
+    phase: "Error", message: condition message
   ELSE:
-    UPDATE channel.status:
-      phase: "Pending"
-      message: "Waiting for connector pod to be ready"
+    phase: "Pending", message: "Waiting for connector to become ready"
+
+  Requeue after 300s
 ```
 
-### Channel Spec Change Detection
+### Deletion
 
-The Controller must detect meaningful changes to avoid unnecessary Deployment updates:
+ownerReferences on the Connector Deployment cause K8s garbage collector to delete it automatically when the Channel CR is deleted. No explicit delete logic needed.
 
-```
-specChanged(existing, desired):
-  Compare:
-    - container image
-    - container env vars (CHANNEL_TYPE, CHANNEL_NAME, config vars)
-    - secretRef name
-    - labels
-  Ignore:
-    - status fields
-    - resourceVersion
-    - annotations not set by controller
-```
+### Helper: `to_upper_snake`
+
+Converts camelCase/kebab-case config keys to UPPER_SNAKE_CASE for env vars:
+- `botToken` → `BOT_TOKEN`
+- `allowedChatIds` → `ALLOWED_CHAT_IDS`
+- `some-key` → `SOME_KEY`
 
 ---
 
@@ -230,135 +146,46 @@ specChanged(existing, desired):
 
 ### Trigger
 
-K8s informer fires on Skill CR create/update/delete → key (`namespace/name`) enqueued to skillWorkQueue.
+kube-rs `Controller::new(skills)` — reconciles on Skill CR changes. Uses `kube::runtime::finalizer` with finalizer name `skills.kk.io/cleanup` for cleanup on delete.
 
 ### Logic
 
 ```
-skillReconcile(key):
-
-  skill = GET Skill CR by key from API server
-
-  ┌──────────────────────────────────────────────────────┐
-  │ CASE 1: Skill CR was deleted (skill == nil)          │
-  └──────────────────────────────────────────────────────┘
-
-  skillDir = $DATA_DIR + "/skills/" + extractNameFromKey(key)
-  IF exists(skillDir):
-    rm -rf skillDir
-    log.Info("Removed skill from PVC", "skill", extractNameFromKey(key))
-  RETURN
-
-  ┌──────────────────────────────────────────────────────┐
-  │ CASE 2: Skill CR exists (create or update)           │
-  └──────────────────────────────────────────────────────┘
-
-  source = skill.spec.source
-  # Example: "vercel-labs/agent-skills/skills/frontend-design"
+Finalizer::Apply(skill):
 
   # 1. Parse source
-  parts = source.split("/")
-  IF len(parts) < 3:
-    UPDATE skill.status:
-      phase: "Error"
-      message: "Invalid source format. Expected: owner/repo/path/to/skill. Got: " + source
-    RETURN
-
-  owner    = parts[0]                    # "vercel-labs"
-  repo     = parts[1]                    # "agent-skills"
-  skillPath = join("/", parts[2:])       # "skills/frontend-design"
-  cloneURL = "https://github.com/" + owner + "/" + repo + ".git"
+  source = skill.spec.source  # e.g. "acme/skills-repo/tools/weather"
+  Split into owner/repo/path (min 3 segments)
+  cloneURL = "https://github.com/{owner}/{repo}.git"
 
   # 2. Update status → Fetching
-  UPDATE skill.status:
-    phase: "Fetching"
-    message: "Cloning " + owner + "/" + repo
+  phase: "Fetching", message: "Cloning repository"
 
-  # 3. Clone to temp dir
-  tmpDir = mktemp("-d", "/tmp/skill-" + skill.metadata.name + "-XXXXXX")
+  # 3. Git clone (shallow, treeless) to temp dir
+  git clone --depth 1 --single-branch --filter=blob:none {cloneURL} {tmpDir}
+  Timeout: SKILL_CLONE_TIMEOUT seconds (via tokio::time::timeout)
 
-  result = exec(
-    "git", "clone",
-    "--depth", "1",
-    "--single-branch",
-    "--filter=blob:none",      # treeless clone — faster for large repos
-    cloneURL,
-    tmpDir,
-    timeout: SKILL_CLONE_TIMEOUT seconds
-  )
+  # 4. Validate skill path exists in cloned repo
+  IF tmpDir/{path} is not a directory → Error
 
-  IF result.exitCode != 0:
-    UPDATE skill.status:
-      phase: "Error"
-      message: "git clone failed: " + truncate(result.stderr, 200)
-    rm -rf tmpDir
-    RETURN
+  # 5. Validate SKILL.md exists and parse frontmatter
+  Read tmpDir/{path}/SKILL.md
+  Parse YAML between --- delimiters → requires name + description fields
 
-  # 4. Validate skill dir exists in cloned repo
-  skillSrcDir = tmpDir + "/" + skillPath
-  IF not isDirectory(skillSrcDir):
-    UPDATE skill.status:
-      phase: "Error"
-      message: "Path '" + skillPath + "' not found in repo " + owner + "/" + repo
-    rm -rf tmpDir
-    RETURN
+  # 6. Copy skill dir to PVC
+  rm -rf $DATA_DIR/skills/{skill.name}
+  cp -r tmpDir/{path} → $DATA_DIR/skills/{skill.name}
 
-  # 5. Validate SKILL.md exists
-  skillMdPath = skillSrcDir + "/SKILL.md"
-  IF not exists(skillMdPath):
-    UPDATE skill.status:
-      phase: "Error"
-      message: "SKILL.md not found at " + skillPath + "/SKILL.md"
-    rm -rf tmpDir
-    RETURN
+  # 7. Set permissions
+  Directories: 755, regular files: 644, scripts (.sh, .py, "run"): 755
 
-  # 6. Parse SKILL.md frontmatter
-  content = readFile(skillMdPath)
-  frontmatter = parseYamlFrontmatter(content)
-  #   Expects:
-  #   ---
-  #   name: frontend-design
-  #   description: React and Next.js performance optimization guidelines
-  #   ---
+  # 8. Update status → Ready
+  phase: "Ready", skillName, skillDescription, lastFetched (ISO 8601)
 
-  IF not frontmatter.name:
-    UPDATE skill.status:
-      phase: "Error"
-      message: "SKILL.md missing required 'name' field in YAML frontmatter"
-    rm -rf tmpDir
-    RETURN
+  # 9. Cleanup temp dir
 
-  IF not frontmatter.description:
-    UPDATE skill.status:
-      phase: "Error"
-      message: "SKILL.md missing required 'description' field in YAML frontmatter"
-    rm -rf tmpDir
-    RETURN
-
-  # 7. Copy to PVC (atomic-ish: remove old, copy new)
-  destDir = $DATA_DIR + "/skills/" + skill.metadata.name
-  rm -rf destDir
-  cp -r skillSrcDir destDir
-
-  # 8. Set permissions
-  chmod -R a+rX destDir                  # readable by all (Agent Jobs run as different user)
-  IF isDirectory(destDir + "/scripts"):
-    find destDir + "/scripts" -type f -exec chmod a+x {} \;   # scripts must be executable
-
-  # 9. Update status → Ready
-  UPDATE skill.status:
-    phase:            "Ready"
-    skillName:        frontmatter.name
-    skillDescription: truncate(frontmatter.description, 256)
-    lastFetched:      now().toISO8601()
-    message:          ""
-
-  # 10. Cleanup temp dir
-  rm -rf tmpDir
-  log.Info("Skill installed",
-    "skill", skill.metadata.name,
-    "name", frontmatter.name,
-    "source", source)
+Finalizer::Cleanup(skill):
+  rm -rf $DATA_DIR/skills/{skill.name}
 ```
 
 ### YAML Frontmatter Parsing
@@ -376,20 +203,7 @@ description: React and Next.js performance optimization guidelines from Vercel E
 Instructions for the agent...
 ```
 
-Parsing logic:
-
-```
-parseYamlFrontmatter(content):
-  IF not content.startsWith("---"):
-    RETURN {}
-  
-  endIndex = content.indexOf("---", 3)   # find closing ---
-  IF endIndex == -1:
-    RETURN {}
-  
-  yamlStr = content.substring(3, endIndex).trim()
-  RETURN yaml.parse(yamlStr)             # returns { name, description, ... }
-```
+Required fields: `name` (non-empty), `description` (non-empty). Parsed via `serde_yaml`.
 
 ---
 
@@ -400,31 +214,28 @@ parseYamlFrontmatter(content):
 | Error | Detection | Status Update | Recovery |
 |---|---|---|---|
 | Secret not found | GET Secret returns 404 | phase=Error, message="Secret not found" | Requeue after 30s (secret may be created later) |
-| Deployment create fails | K8s API error | phase=Error, message=API error | Requeue with exponential backoff |
-| Connector crashlooping | Pod status check | phase=Error, message=crash reason | Requeue after 60s (auto-heals if transient) |
-| Invalid channel type | Deployment created but connector exits | phase=Error via pod status | User must fix CR spec |
+| Deployment apply fails | K8s API error | Propagated via error_policy | Requeue after 30s |
+| Connector crashlooping | Deployment condition check | phase=Error, message=condition message | Requeue after 300s (auto-heals if transient) |
+| Invalid channel type | Deployment created but connector exits | phase=Error via Deployment status | User must fix CR spec |
 
 ### Skill Errors
 
 | Error | Detection | Status Update | Recovery |
 |---|---|---|---|
-| Invalid source format | String parsing | phase=Error, message="Invalid source format..." | User must fix CR spec |
-| Git clone fails (404) | git exit code + stderr | phase=Error, message="git clone failed: ..." | User deletes + recreates CR |
-| Git clone fails (network) | git exit code + stderr | phase=Error, message=stderr | User deletes + recreates CR |
-| Git clone timeout | Process killed after SKILL_CLONE_TIMEOUT | phase=Error, message="Clone timed out" | User deletes + recreates CR |
-| Path not found in repo | Directory check | phase=Error, message="Path not found..." | User must fix source path |
-| SKILL.md missing | File check | phase=Error, message="SKILL.md not found..." | User must fix source path |
-| Frontmatter invalid | YAML parse | phase=Error, message="Missing name/description" | Upstream skill must be fixed |
-| PVC write fails | cp/chmod error | phase=Error, message=OS error | Check PVC capacity/permissions |
+| Invalid source format | String parsing (< 3 segments) | phase=Error, message="expected owner/repo/path" | Requeue after 300s |
+| Git clone fails (404) | git exit code + stderr | phase=Error, message="git clone failed: ..." | Error propagated, requeue after 60s |
+| Git clone timeout | tokio::time::timeout | phase=Error, message="timed out after Ns" | Error propagated, requeue after 60s |
+| Path not found in repo | Directory check | phase=Error | Error propagated, requeue after 60s |
+| SKILL.md missing | File check | phase=Error | Error propagated, requeue after 60s |
+| Frontmatter invalid | serde_yaml parse | phase=Error, message="invalid frontmatter YAML" | Error propagated, requeue after 60s |
+| PVC write fails | std::io::Error | phase=Error | Error propagated, requeue after 60s |
 
 ### Requeue Strategy
 
-| CRD | On success | On transient error | On permanent error |
-|---|---|---|---|
-| Channel | No requeue (watches for changes) | Requeue after 30s with exponential backoff (max 5m) | No requeue — user must fix CR |
-| Skill | No requeue | No requeue — user deletes + recreates | No requeue — user must fix CR |
-
-Skills do NOT requeue on failure because the recovery path is always delete + recreate. This avoids the Controller repeatedly cloning a repo that doesn't exist.
+| CRD | On success | On error |
+|---|---|---|
+| Channel | Requeue after 300s (periodic re-check) | Requeue after 30s (via error_policy) |
+| Skill | `await_change()` (no periodic requeue) | Requeue after 60s (via error_policy) |
 
 ---
 
@@ -448,7 +259,7 @@ rules:
   resources: ["channels", "channels/status"]
   verbs: ["get", "list", "watch", "update", "patch"]
 
-# Watch and update Skill CRs
+# Watch and update Skill CRs (including finalizer management)
 - apiGroups: ["kk.io"]
   resources: ["skills", "skills/status"]
   verbs: ["get", "list", "watch", "update", "patch"]
@@ -456,12 +267,7 @@ rules:
 # Manage Connector Deployments (child of Channel CRs)
 - apiGroups: ["apps"]
   resources: ["deployments"]
-  verbs: ["create", "get", "list", "watch", "update", "delete"]
-
-# Read Pods (for Connector readiness checks)
-- apiGroups: [""]
-  resources: ["pods"]
-  verbs: ["get", "list"]
+  verbs: ["create", "get", "list", "watch", "update", "patch", "delete"]
 
 # Validate that Secrets exist (read-only)
 - apiGroups: [""]
@@ -520,8 +326,8 @@ spec:
           value: /data
         - name: SKILL_CLONE_TIMEOUT
           value: "60"
-        - name: RECONCILE_WORKERS
-          value: "2"
+        - name: PVC_CLAIM_NAME
+          value: kk-data
         volumeMounts:
         - name: data
           mountPath: /data
@@ -558,58 +364,77 @@ The Controller exposes two HTTP endpoints on port 8081 (internal only, no Servic
 
 | Endpoint | Meaning | Returns 200 when |
 |---|---|---|
-| `GET /healthz` | Liveness | Process is running, not deadlocked |
-| `GET /readyz` | Readiness | Informer caches are synced, work queues are processing |
+| `GET /healthz` | Liveness | Process is running |
+| `GET /readyz` | Readiness | Process is running |
 
 ---
 
 ## Logging
 
-Structured JSON logs (for easy parsing by log aggregators):
+Structured JSON logs via `tracing` + `tracing-subscriber` (JSON format, level controlled by `RUST_LOG`):
 
 ```jsonc
 // Startup
-{"level":"info","msg":"Starting controller","version":"v0.1.0","namespace":"kk"}
-{"level":"info","msg":"CRDs verified","channels":true,"skills":true}
-{"level":"info","msg":"Informer caches synced","duration_ms":1200}
+{"level":"info","message":"starting kk-controller"}
+{"level":"info","message":"loaded config","namespace":"kk","data_dir":"/data"}
+{"level":"info","message":"health server listening on :8081"}
+{"level":"info","message":"starting channel controller"}
+{"level":"info","message":"starting skill controller"}
 
 // Channel reconciliation
-{"level":"info","msg":"Reconciling channel","channel":"telegram-bot-1","event":"create"}
-{"level":"info","msg":"Created connector deployment","channel":"telegram-bot-1","deployment":"connector-telegram-bot-1"}
-{"level":"info","msg":"Channel connected","channel":"telegram-bot-1","pod":"connector-telegram-bot-1-abc12"}
+{"level":"info","message":"reconciling channel","channel":"telegram-bot-1","namespace":"kk"}
+{"level":"info","message":"channel reconciled","channel":"telegram-bot-1","phase":"Connected"}
 
 // Skill reconciliation
-{"level":"info","msg":"Reconciling skill","skill":"frontend-design","source":"vercel-labs/agent-skills/skills/frontend-design"}
-{"level":"info","msg":"Cloning repo","skill":"frontend-design","repo":"vercel-labs/agent-skills"}
-{"level":"info","msg":"Skill installed","skill":"frontend-design","name":"frontend-design","description":"React and Next.js..."}
+{"level":"info","message":"applying skill","skill":"frontend-design","source":"acme/skills-repo/tools/weather"}
+{"level":"info","message":"skill installed successfully","skill":"frontend-design"}
 
 // Errors
-{"level":"error","msg":"git clone failed","skill":"bad-skill","error":"repository not found","stderr":"..."}
-{"level":"error","msg":"Secret not found","channel":"slack-eng","secretRef":"slack-eng-creds"}
+{"level":"warn","message":"secret not found","channel":"slack-eng","secret":"slack-eng-creds"}
+{"level":"error","message":"channel reconciliation error","channel":"slack-eng","error":"..."}
+{"level":"error","message":"skill reconciliation error","skill":"bad-skill","error":"git clone failed: ..."}
 ```
 
 ---
 
-## Testing Checklist
+## Unit Tests
 
-### Channel Tests
-- [ ] Create Channel CR → Connector Deployment created with correct env, labels, ownerRef
-- [ ] Delete Channel CR → Connector Deployment garbage collected
-- [ ] Update Channel CR secretRef → Connector Deployment updated
-- [ ] Channel CR with non-existent Secret → status=Error
-- [ ] Connector pod crashlooping → Channel status=Error with reason
-- [ ] Connector pod becomes ready → Channel status=Connected
+13 unit tests in `crates/kk-controller` covering all pure functions:
 
-### Skill Tests
-- [ ] Create Skill CR with valid source → files appear at `/data/skills/{name}/`
-- [ ] SKILL.md frontmatter parsed → status shows skillName + skillDescription
-- [ ] Delete Skill CR → `/data/skills/{name}/` removed
-- [ ] Invalid source format (< 3 segments) → status=Error
-- [ ] Source points to non-existent repo → status=Error with git stderr
-- [ ] Source points to non-existent path in valid repo → status=Error
-- [ ] SKILL.md missing from path → status=Error
-- [ ] SKILL.md missing frontmatter name → status=Error
-- [ ] SKILL.md missing frontmatter description → status=Error
-- [ ] Scripts in skill dir → executable permissions set
-- [ ] Two Skill CRs from same repo → both installed independently
-- [ ] Git clone timeout → status=Error with timeout message
+### Config (`src/config.rs`)
+- `test_config_from_env` — defaults, env overrides, invalid timeout fallback
+
+### Channel (`src/reconcilers/channel.rs`)
+- `test_to_upper_snake` — camelCase, kebab-case, dot-case conversions
+- `test_build_connector_deployment_basic` — metadata, ownerRef, labels, env vars, secretRef, PVC mount
+- `test_build_connector_deployment_with_config` — spec.config merged as CONFIG_* env vars
+
+### Skill (`src/reconcilers/skill.rs`)
+- `test_parse_source_valid` — full path with nested dirs
+- `test_parse_source_minimal` — 3-segment minimum
+- `test_parse_source_too_few_parts` — rejects 1 or 2 segments
+- `test_parse_source_empty_segment` — rejects empty owner/repo/path
+- `test_parse_frontmatter_valid` — extracts name + description
+- `test_parse_frontmatter_missing_name` — rejects missing required field
+- `test_parse_frontmatter_no_delimiters` — rejects non-frontmatter content
+- `test_parse_frontmatter_missing_closing` — rejects unclosed frontmatter
+- `test_parse_frontmatter_empty_name` — rejects empty name string
+
+### Integration Tests (require live K8s cluster)
+
+| Test | What it verifies |
+|---|---|
+| Create Channel CR → Connector Deployment created with correct env, labels, ownerRef | Channel reconciler |
+| Delete Channel CR → Connector Deployment garbage collected | ownerReferences |
+| Update Channel CR secretRef → Connector Deployment updated | Server-side apply |
+| Channel CR with non-existent Secret → status=Error | Secret validation |
+| Connector pod crashlooping → Channel status=Error with reason | Status detection |
+| Connector pod becomes ready → Channel status=Connected | Status detection |
+| Create Skill CR with valid source → files at `/data/skills/{name}/` | Skill reconciler |
+| Delete Skill CR → `/data/skills/{name}/` removed | Finalizer cleanup |
+| Invalid source format → status=Error | Source parsing |
+| Source points to non-existent repo → status=Error | Git clone error |
+| Git clone timeout → status=Error | Timeout handling |
+| SKILL.md missing from path → status=Error | File validation |
+| SKILL.md missing frontmatter name → status=Error | Frontmatter parsing |
+| Scripts in skill dir → executable permissions set | Permission handling |
