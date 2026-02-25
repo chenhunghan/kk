@@ -268,22 +268,26 @@ fn extract_text_from_lines(lines: &str) -> Option<String> {
         if line.trim().is_empty() {
             continue;
         }
-        // Claude format
+        // Claude format — only skip further checks for lines we actually handle.
+        // (ResultLine parses ANY {"type":...} object due to serde defaults, so
+        //  we must not `continue` unconditionally or Codex lines get skipped.)
         if let Ok(rl) = serde_json::from_str::<ResultLine>(line) {
             if rl.line_type == "result" {
                 if let Some(text) = rl.result {
                     last = Some(text);
                 }
-            } else if rl.line_type == "assistant"
-                && let Some(msg) = rl.message
-            {
-                for block in msg.content {
-                    if let ContentBlock::Text { text } = block {
-                        last = Some(text);
+                continue;
+            } else if rl.line_type == "assistant" {
+                if let Some(msg) = rl.message {
+                    for block in msg.content {
+                        if let ContentBlock::Text { text } = block {
+                            last = Some(text);
+                        }
                     }
                 }
+                continue;
             }
-            continue;
+            // Other type values (e.g. Codex "item.completed") fall through.
         }
         // Codex format: item.completed with item.type=agent_message
         if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
