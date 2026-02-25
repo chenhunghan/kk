@@ -1,0 +1,49 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kk-core",
+    "crates/kk-controller",
+    "crates/kk-gateway",
+    "crates/kk-connector",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT"
+
+[workspace.dependencies]
+# Async runtime
+tokio = { version = "1", features = ["full"] }
+
+# Serialization
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+
+# Logging / tracing
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+# Kubernetes
+kube = { version = "0.98", features = ["runtime", "derive"] }
+k8s-openapi = { version = "0.24", features = ["v1_32"] }
+
+# HTTP (health endpoints)
+axum = "0.8"
+
+# Error handling
+anyhow = "1"
+thiserror = "2"
+
+# Misc
+uuid = { version = "1", features = ["v4"] }
+chrono = { version = "0.4", features = ["serde"] }
+rand = "0.9"
+
+# Internal
+kk-core = { path = "crates/kk-core" }
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
