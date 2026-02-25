@@ -2,9 +2,8 @@ use anyhow::{Context, Result};
 use std::fs::{File, OpenOptions};
 use std::path::Path;
 use std::process::Command;
-use kk_core::types::ResultLine;
 
-use crate::agent::{CodeAgent, AgentResult};
+use crate::agent::{AgentResult, CodeAgent};
 
 pub struct Codex;
 
@@ -97,7 +96,7 @@ impl CodeAgent for Codex {
 
         let mut cmd = Command::new(bin);
         cmd.arg("exec").arg("resume");
-        
+
         if let Some(sid) = session_id {
             cmd.arg(sid);
         } else {
@@ -121,15 +120,17 @@ impl CodeAgent for Codex {
     }
 
     fn extract_session_id(&self, response_path: &Path) -> Option<String> {
+        // Codex session ID is the thread_id from the "thread.started" line.
         let content = std::fs::read_to_string(response_path).ok()?;
-        for line in content.lines().rev() {
+        for line in content.lines() {
             if line.trim().is_empty() {
                 continue;
             }
-            if let Ok(rl) = serde_json::from_str::<ResultLine>(line)
-                && let Some(sid) = rl.session_id
+            if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+                && val.get("type").and_then(|v| v.as_str()) == Some("thread.started")
+                && let Some(tid) = val.get("thread_id").and_then(|v| v.as_str())
             {
-                return Some(sid);
+                return Some(tid.to_string());
             }
         }
         None

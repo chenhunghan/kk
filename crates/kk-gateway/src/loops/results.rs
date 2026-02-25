@@ -217,29 +217,7 @@ async fn try_stream_partial(state: &SharedState, session_id: &str) -> Result<()>
     file.read_to_end(&mut new_bytes)?;
 
     let new_text = String::from_utf8_lossy(&new_bytes);
-
-    // Extract the latest assistant/result text from new lines
-    let mut latest_text: Option<String> = None;
-    for line in new_text.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(rl) = serde_json::from_str::<ResultLine>(line) {
-            if rl.line_type == "result" {
-                if let Some(text) = rl.result {
-                    latest_text = Some(text);
-                }
-            } else if rl.line_type == "assistant"
-                && let Some(msg) = rl.message
-            {
-                for block in msg.content {
-                    if let ContentBlock::Text { text } = block {
-                        latest_text = Some(text);
-                    }
-                }
-            }
-        }
-    }
+    let latest_text = extract_text_from_lines(&new_text);
 
     // Update offset
     state
@@ -280,6 +258,46 @@ async fn try_stream_partial(state: &SharedState, session_id: &str) -> Result<()>
     Ok(())
 }
 
+/// Extract the latest agent response text from a slice of JSONL lines.
+/// Understands two formats:
+///   Claude: `{"type":"result","result":"..."}` or `{"type":"assistant","message":{...}}`
+///   Codex:  `{"type":"item.completed","item":{"type":"agent_message","text":"..."}}`
+fn extract_text_from_lines(lines: &str) -> Option<String> {
+    let mut last: Option<String> = None;
+    for line in lines.lines() {
+        if line.trim().is_empty() {
+            continue;
+        }
+        // Claude format
+        if let Ok(rl) = serde_json::from_str::<ResultLine>(line) {
+            if rl.line_type == "result" {
+                if let Some(text) = rl.result {
+                    last = Some(text);
+                }
+            } else if rl.line_type == "assistant"
+                && let Some(msg) = rl.message
+            {
+                for block in msg.content {
+                    if let ContentBlock::Text { text } = block {
+                        last = Some(text);
+                    }
+                }
+            }
+            continue;
+        }
+        // Codex format: item.completed with item.type=agent_message
+        if let Ok(val) = serde_json::from_str::<serde_json::Value>(line)
+            && val.get("type").and_then(|v| v.as_str()) == Some("item.completed")
+            && let Some(item) = val.get("item")
+            && item.get("type").and_then(|v| v.as_str()) == Some("agent_message")
+            && let Some(text) = item.get("text").and_then(|v| v.as_str())
+        {
+            last = Some(text.to_string());
+        }
+    }
+    last
+}
+
 fn read_manifest(state: &SharedState, session_id: &str) -> Result<RequestManifest> {
     let path = state.paths.request_manifest(session_id);
     let content = std::fs::read_to_string(&path)
@@ -288,40 +306,13 @@ fn read_manifest(state: &SharedState, session_id: &str) -> Result<RequestManifes
 }
 
 /// Extract the final response text from response.jsonl.
-/// Strategy: last "result" line wins; fallback to last "assistant" text block.
+/// Handles both Claude and Codex JSONL output formats via `extract_text_from_lines`.
 fn extract_response_text(jsonl_path: &Path) -> Result<String> {
     if !jsonl_path.exists() {
         return Ok("(no response file)".to_string());
     }
-
     let content = std::fs::read_to_string(jsonl_path)?;
-    let mut last_result: Option<String> = None;
-    let mut last_assistant_text: Option<String> = None;
-
-    for line in content.lines() {
-        if line.trim().is_empty() {
-            continue;
-        }
-        if let Ok(rl) = serde_json::from_str::<ResultLine>(line) {
-            if rl.line_type == "result" {
-                if let Some(text) = rl.result {
-                    last_result = Some(text);
-                }
-            } else if rl.line_type == "assistant"
-                && let Some(msg) = rl.message
-            {
-                for block in msg.content {
-                    if let ContentBlock::Text { text } = block {
-                        last_assistant_text = Some(text);
-                    }
-                }
-            }
-        }
-    }
-
-    Ok(last_result
-        .or(last_assistant_text)
-        .unwrap_or_else(|| "(no response)".to_string()))
+    Ok(extract_text_from_lines(&content).unwrap_or_else(|| "(no response)".to_string()))
 }
 
 fn write_outbound(state: &SharedState, manifest: &RequestManifest, text: &str) -> Result<()> {
