@@ -1277,6 +1277,17 @@ dependencies = [
 ]
 
 [[package]]
+name = "kk-agent"
+version = "0.1.0"
+dependencies = [
+ "anyhow",
+ "kk-core",
+ "serde_json",
+ "tempfile",
+ "tracing",
+]
+
+[[package]]
 name = "kk-connector"
 version = "0.1.0"
 dependencies = [

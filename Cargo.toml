@@ -5,6 +5,7 @@ members = [
     "crates/kk-controller",
     "crates/kk-gateway",
     "crates/kk-connector",
+    "crates/kk-agent",
 ]
 
 [workspace.package]
