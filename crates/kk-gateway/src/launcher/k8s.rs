@@ -348,6 +348,34 @@ mod tests {
         );
         let thread_env = env.iter().find(|e| e.name == "THREAD_ID").unwrap();
         assert_eq!(thread_env.value.as_deref(), Some("42"));
+
+        let agent_type_env = env.iter().find(|e| e.name == "AGENT_TYPE").unwrap();
+        assert_eq!(agent_type_env.value.as_deref(), Some("claude"));
+    }
+
+    #[test]
+    fn test_build_agent_job_gemini() {
+        let msg = InboundMessage {
+            channel: "test-channel".to_string(),
+            channel_type: kk_core::types::ChannelType::Telegram,
+            group: "test-group".to_string(),
+            thread_id: None,
+            sender: "alice".to_string(),
+            text: "hello".to_string(),
+            timestamp: 1000,
+            meta: serde_json::json!({}),
+        };
+
+        let mut config = crate::config::GatewayConfig::from_env();
+        config.agent_type = "gemini".to_string();
+
+        let job = build_agent_job("agent-test", "sess-test", &msg, &config);
+        let pod_spec = job.spec.unwrap().template.spec.unwrap();
+        let container = &pod_spec.containers[0];
+        let env = container.env.as_ref().unwrap();
+
+        let agent_type_env = env.iter().find(|e| e.name == "AGENT_TYPE").unwrap();
+        assert_eq!(agent_type_env.value.as_deref(), Some("gemini"));
     }
 
     #[test]
