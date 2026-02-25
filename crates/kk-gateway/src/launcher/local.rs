@@ -54,7 +54,8 @@ impl Launcher for LocalLauncher {
             .env("GROUP", &msg.group)
             .env("DATA_DIR", &self.data_dir)
             .env("IDLE_TIMEOUT", config.job_idle_timeout.to_string())
-            .env("MAX_TURNS", config.job_max_turns.to_string());
+            .env("MAX_TURNS", config.job_max_turns.to_string())
+            .env("AGENT_TYPE", &config.agent_type);
 
         if let Some(ref tid) = msg.thread_id {
             cmd.env("THREAD_ID", tid);

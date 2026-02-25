@@ -22,6 +22,7 @@ pub struct GatewayConfig {
     pub results_archive_ttl: u64,
     pub pvc_claim_name: String,
     pub state_reload_interval_ms: u64,
+    pub agent_type: String,
 }
 
 impl GatewayConfig {
@@ -46,6 +47,7 @@ impl GatewayConfig {
             results_archive_ttl: env_u64("RESULTS_ARCHIVE_TTL", 86400),
             pvc_claim_name: env::var("PVC_CLAIM_NAME").unwrap_or_else(|_| "kk-data".into()),
             state_reload_interval_ms: env_u64("STATE_RELOAD_INTERVAL", 30000),
+            agent_type: env::var("AGENT_TYPE").unwrap_or_else(|_| "claude".into()),
         }
     }
 }

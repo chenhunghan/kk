@@ -214,6 +214,11 @@ fn build_agent_job(
             value: Some(config.job_max_turns.to_string()),
             ..Default::default()
         },
+        EnvVar {
+            name: "AGENT_TYPE".to_string(),
+            value: Some(config.agent_type.clone()),
+            ..Default::default()
+        },
     ];
 
     if let Some(ref tid) = msg.thread_id {

@@ -506,6 +506,7 @@ async fn groups_d_merge() {
         results_archive_ttl: 86400,
         pvc_claim_name: "kk-data".to_string(),
         state_reload_interval_ms: 30000,
+        agent_type: "claude".to_string(),
     };
 
     let launcher: std::sync::Arc<dyn kk_gateway::launcher::Launcher> =

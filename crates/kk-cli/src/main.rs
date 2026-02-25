@@ -19,9 +19,24 @@ use kk_gateway::state::SharedState;
 async fn main() -> Result<()> {
     kk_core::logging::init();
 
-    let kk_config = KkConfig::load()?;
+    let mut kk_config = KkConfig::load()?;
+
+    // Simple manual argument parsing
+    let args: Vec<String> = std::env::args().collect();
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--agent" if i + 1 < args.len() => {
+                kk_config.agent_type = args[i + 1].clone();
+                i += 2;
+            }
+            _ => i += 1,
+        }
+    }
+
     info!(
         data_dir = kk_config.data_dir,
+        agent = kk_config.agent_type,
         channels = kk_config.channels.len(),
         "starting kk"
     );
@@ -204,5 +219,6 @@ fn build_gateway_config(kk: &KkConfig) -> GatewayConfig {
         results_archive_ttl: 86400,
         pvc_claim_name: String::new(),
         state_reload_interval_ms: 30000,
+        agent_type: kk.agent_type.clone(),
     }
 }

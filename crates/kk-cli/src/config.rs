@@ -11,6 +11,9 @@ pub struct KkConfig {
     #[serde(default = "default_agent_bin")]
     pub agent_bin: String,
 
+    #[serde(default = "default_agent_type")]
+    pub agent_type: String,
+
     #[serde(default = "default_idle_timeout")]
     pub idle_timeout: u64,
 
@@ -38,6 +41,9 @@ fn default_data_dir() -> String {
 fn default_agent_bin() -> String {
     "kk-agent".into()
 }
+fn default_agent_type() -> String {
+    "claude".into()
+}
 fn default_idle_timeout() -> u64 {
     120
 }
@@ -50,6 +56,7 @@ impl Default for KkConfig {
         Self {
             data_dir: default_data_dir(),
             agent_bin: default_agent_bin(),
+            agent_type: default_agent_type(),
             idle_timeout: default_idle_timeout(),
             max_turns: default_max_turns(),
             channels: Vec::new(),
