@@ -443,6 +443,30 @@ mod tests {
         assert_eq!(text, "(no response)");
     }
 
+    #[test]
+    fn test_extract_text_claude_result() {
+        let lines = concat!(
+            r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"thinking..."}]}}"#,
+            "\n",
+            r#"{"type":"result","result":"The answer is 42."}"#,
+            "\n",
+        );
+        assert_eq!(
+            extract_text_from_lines(lines),
+            Some("The answer is 42.".to_string())
+        );
+    }
+
+    #[test]
+    fn test_extract_text_claude_assistant_fallback() {
+        // No result line — falls back to last assistant text block.
+        let lines = r#"{"type":"assistant","message":{"role":"assistant","content":[{"type":"text","text":"Here is my answer."}]}}"#;
+        assert_eq!(
+            extract_text_from_lines(lines),
+            Some("Here is my answer.".to_string())
+        );
+    }
+
     // Codex produces {"type":"item.completed","item":{"type":"agent_message","text":"..."}}
     // ResultLine parses ANY {"type":...} object due to serde defaults, so the old
     // unconditional `continue` after the Claude block silently discarded all Codex lines.
