@@ -160,7 +160,9 @@ Both functions called from the same polling loop in `main.rs`.
 
 ---
 
-## Phase 3: Slack Native Streaming (Planned, Not Implemented)
+## Phase 3: Slack Native Streaming (Implemented)
+
+> Status: **Done** — committed as `2b06c77`
 
 Slack launched purpose-built LLM streaming APIs in October 2025. These bypass the edit-in-place pattern entirely — the client sees a real-time streaming animation, and `appendStream` has Tier 4 rate limits (100+/min), much higher than `chat.update` (Tier 3: 50+/min).
 
@@ -176,32 +178,27 @@ Slack launched purpose-built LLM streaming APIs in October 2025. These bypass th
 
 **Required Slack scopes:** `chat:write`, `assistant:write` (the streaming APIs are part of the "AI in Slack" feature set).
 
-**Required fields:** `recipient_user_id` and `recipient_team_id` must be passed on `startStream`. These identify who triggered the AI response. kk's inbound Slack messages already capture `user_id` in meta — we also need to capture `team_id`.
+**Required fields:** `recipient_user_id` and `recipient_team_id` must be passed on `startStream`. These identify who triggered the AI response.
 
-### Approach: Extend `ChatProvider` Trait
+### ChatProvider Trait Extension
 
-Add optional native streaming methods with default implementations that return errors. Only `SlackOutbound` overrides them:
+Added optional native streaming methods with default implementations that return errors. Only `SlackOutbound` overrides them:
 
 ```rust
 #[async_trait]
 pub trait ChatProvider: Send + Sync {
-    // ... existing required methods ...
+    // ... existing required methods (send, send_returning_id, edit) ...
 
-    /// Whether this provider supports native streaming (e.g. Slack).
-    /// Default: false — use edit-in-place fallback.
     fn supports_native_stream(&self) -> bool { false }
 
-    /// Start a native streaming session. Returns platform message ID.
     async fn stream_start(&self, _msg: &OutboundMessage) -> Result<String> {
         bail!("native streaming not supported")
     }
 
-    /// Append text to an active native stream.
     async fn stream_append(&self, _msg: &OutboundMessage, _platform_msg_id: &str) -> Result<()> {
         bail!("native streaming not supported")
     }
 
-    /// Finalize an active native stream.
     async fn stream_stop(&self, _msg: &OutboundMessage, _platform_msg_id: &str) -> Result<()> {
         bail!("native streaming not supported")
     }
@@ -210,44 +207,47 @@ pub trait ChatProvider: Send + Sync {
 
 ### Outbound Dispatch Changes
 
-Modify `poll_stream()` to prefer native streaming when `supports_native_stream()` returns true:
+`poll_stream()` checks `sender.supports_native_stream()` and dispatches accordingly:
 
 - First message: `stream_start()` instead of `send_returning_id()`
 - Subsequent: `stream_append()` instead of `edit()`
-- Final: `stream_append()` + `stream_stop()` instead of `edit()`
+- Final: `stream_stop()` instead of `edit()`
+- Final without prior streaming: `send()` (same for both paths)
 
-### Slack Inbound: Capture `team_id`
+### Slack Inbound: `team_id` Captured
 
-The Slack inbound handler needs to also capture `team_id` from the event payload so it's available for native streaming:
+The Slack inbound handler now captures `team_id` from the event payload:
 
 ```rust
 meta: serde_json::json!({
     "channel_id": channel_id,
     "message_ts": ts,
     "user_id": user,
-    "team_id": team_id,  // NEW: needed for chat.startStream
+    "team_id": event["team"].as_str().unwrap_or_default(),
 }),
 ```
 
-### When to Use Native vs Fallback
+### Tests
 
-The decision is automatic via `supports_native_stream()`:
-- **Slack** → native `startStream`/`appendStream`/`stopStream`
-- **Telegram** → fallback `send_returning_id` + `edit`
-- **Future providers** → override `supports_native_stream() → true` and the stream methods, or get fallback for free
+5 native streaming tests with `NativeStreamMock`:
+- `native_stream_start` — first file triggers `stream_start`, state file created
+- `native_stream_append` — subsequent file triggers `stream_append` with saved msg ID
+- `native_stream_stop_and_cleanup` — final file triggers `stream_stop`, both files deleted
+- `native_stream_final_without_prior_sends_new` — final without prior triggers `send`, file deleted
+- `native_stream_full_lifecycle` — end-to-end: start → append → stop across 3 polls
 
-### Files to Modify
+### Files Modified
 
 | File | Change |
 |---|---|
-| `crates/kk-connector/src/provider/mod.rs` | Add `supports_native_stream`, `stream_start/append/stop` with default impls to `ChatProvider` |
-| `crates/kk-connector/src/provider/slack.rs` | Override native streaming methods, capture `team_id` in inbound meta |
-| `crates/kk-connector/src/outbound.rs` | Prefer native streaming when `supports_native_stream()` returns true |
+| `crates/kk-connector/src/provider/mod.rs` | Added `supports_native_stream`, `stream_start/append/stop` with default impls to `ChatProvider` |
+| `crates/kk-connector/src/provider/slack.rs` | Override native streaming methods using `chat.startStream/appendStream/stopStream`; capture `team_id` in inbound meta |
+| `crates/kk-connector/src/outbound.rs` | `poll_stream()` prefers native streaming when `supports_native_stream()` returns true; 5 new native streaming tests |
 
 ---
 
 ## Verification
 
 1. `cargo build` — all crates compile
-2. `cargo test` — all 137 tests pass (131 existing + 6 new streaming tests)
+2. `cargo test` — all 142 tests pass (131 existing + 6 fallback streaming + 5 native streaming)
 3. `cargo clippy` — no warnings
