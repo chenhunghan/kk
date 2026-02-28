@@ -1,51 +1,594 @@
-use std::io;
-use std::sync::Arc;
+use std::io::{self, BufRead, Read};
+use std::path::PathBuf;
+use std::process::{Command, Stdio};
+use std::sync::mpsc;
+use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
-use anyhow::Result;
-use tokio::process::Command;
-use tokio::sync::mpsc;
-use tracing::{error, info, warn};
-use tracing_subscriber::EnvFilter;
-
-mod config;
-mod terminal;
-
-use config::KkConfig;
-use kk_core::paths::DataPaths;
-use kk_gateway::config::GatewayConfig;
-use kk_gateway::launcher::Launcher;
-use kk_gateway::launcher::local::LocalLauncher;
-use kk_gateway::loops;
-use kk_gateway::state::SharedState;
+use crossterm::event::{self, Event, KeyCode, KeyModifiers};
+use crossterm::execute;
+use crossterm::terminal::{
+    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
+};
+use ratatui::backend::CrosstermBackend;
+use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::{Frame, Terminal};
 
 // ---------------------------------------------------------------------------
-// Custom tracing writer that sends log lines to the TUI log panel channel.
+// Data model
 // ---------------------------------------------------------------------------
 
-struct ChannelWriter(mpsc::UnboundedSender<String>);
+#[allow(dead_code)]
+enum Msg {
+    Output(usize, String),
+    Done(usize),
+    TailPid(usize, u32),
+}
 
-impl io::Write for ChannelWriter {
-    fn write(&mut self, buf: &[u8]) -> io::Result<usize> {
-        if let Ok(s) = std::str::from_utf8(buf) {
-            let s = s.trim_end_matches('\n');
-            if !s.is_empty() {
-                let _ = self.0.send(s.to_string());
-            }
-        }
-        Ok(buf.len())
-    }
-    fn flush(&mut self) -> io::Result<()> {
-        Ok(())
+struct Job {
+    nq_id: String,
+    session_id: String,
+    prompt: String,
+    output: Vec<String>,
+    done: bool,
+    parent: Option<usize>,
+    depth: usize,
+    _turn: u64,
+}
+
+struct Config {
+    claude_args: Vec<String>,
+}
+
+struct App {
+    jobs: Vec<Job>,
+    input: String,
+    cursor: usize,
+    selected: Option<usize>,
+    nqdir: PathBuf,
+    config: Config,
+    quit: bool,
+    job_list_area: Rect,
+    scroll_offset: usize,
+    tail_pids: Arc<Mutex<Vec<u32>>>,
+}
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+fn gen_uuid() -> String {
+    let mut b = [0u8; 16];
+    let mut f = std::fs::File::open("/dev/urandom").expect("/dev/urandom");
+    f.read_exact(&mut b).expect("urandom read");
+    b[6] = (b[6] & 0x0f) | 0x40;
+    b[8] = (b[8] & 0x3f) | 0x80;
+    format!(
+        "{:02x}{:02x}{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        b[0], b[1], b[2], b[3], b[4], b[5], b[6], b[7],
+        b[8], b[9], b[10], b[11], b[12], b[13], b[14], b[15],
+    )
+}
+
+fn queue_dir(session: &str) -> PathBuf {
+    let home = std::env::var("HOME").unwrap_or_else(|_| "/tmp".into());
+    let base = if cfg!(target_os = "macos") {
+        PathBuf::from(&home).join("Library/Caches/kk/queue")
+    } else {
+        let state =
+            std::env::var("XDG_STATE_HOME").unwrap_or_else(|_| format!("{}/.local/state", home));
+        PathBuf::from(state).join("kk/queue")
+    };
+    base.join(&session[..8])
+}
+
+fn check_dependency(name: &str) {
+    let ok = Command::new("which")
+        .arg(name)
+        .stdout(Stdio::null())
+        .stderr(Stdio::null())
+        .status()
+        .map(|s| s.success())
+        .unwrap_or(false);
+    if !ok {
+        eprintln!("error: '{}' not found in PATH", name);
+        eprintln!(
+            "kk requires nq (https://github.com/leahneukirchen/nq) and claude (Claude Code CLI)"
+        );
+        std::process::exit(1);
     }
 }
 
-#[derive(Clone)]
-struct ChannelMakeWriter(mpsc::UnboundedSender<String>);
+// ---------------------------------------------------------------------------
+// CLI argument parsing
+// ---------------------------------------------------------------------------
 
-impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ChannelMakeWriter {
-    type Writer = ChannelWriter;
-    fn make_writer(&'a self) -> Self::Writer {
-        ChannelWriter(self.0.clone())
+const VALUE_FLAGS: &[&str] = &[
+    "--permission-mode",
+    "--model",
+    "--fallback-model",
+    "--max-budget-usd",
+    "--allowedTools",
+    "--disallowedTools",
+    "--system-prompt",
+    "--append-system-prompt",
+    "--agent",
+    "--agents",
+    "--mcp-config",
+    "--tools",
+];
+
+const BOOL_FLAGS: &[&str] = &[
+    "--dangerously-skip-permissions",
+    "--no-session-persistence",
+    "--verbose",
+    "--strict-mcp-config",
+];
+
+fn parse_args() -> Config {
+    let args: Vec<String> = std::env::args().skip(1).collect();
+    let mut claude_args = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        if args[i] == "--help" || args[i] == "-h" {
+            print_help();
+            std::process::exit(0);
+        }
+        if VALUE_FLAGS.contains(&args[i].as_str()) {
+            if i + 1 >= args.len() {
+                eprintln!("error: {} requires a value", args[i]);
+                std::process::exit(1);
+            }
+            claude_args.push(args[i].clone());
+            claude_args.push(args[i + 1].clone());
+            i += 2;
+        } else if BOOL_FLAGS.contains(&args[i].as_str()) {
+            claude_args.push(args[i].clone());
+            i += 1;
+        } else {
+            eprintln!("error: unknown flag: {}", args[i]);
+            std::process::exit(1);
+        }
+    }
+
+    Config { claude_args }
+}
+
+fn print_help() {
+    println!("kk — TUI job queue for Claude Code CLI\n");
+    println!("Usage: kk [claude flags...]\n");
+    println!("All flags are forwarded to `claude -p`. Examples:");
+    println!("  kk");
+    println!("  kk --model haiku");
+    println!("  kk --dangerously-skip-permissions --model sonnet\n");
+    println!("Forwarded value flags:");
+    println!("  --permission-mode, --model, --fallback-model, --max-budget-usd,");
+    println!("  --allowedTools, --disallowedTools, --system-prompt,");
+    println!("  --append-system-prompt, --agent, --agents, --mcp-config, --tools\n");
+    println!("Forwarded boolean flags:");
+    println!("  --dangerously-skip-permissions, --no-session-persistence,");
+    println!("  --verbose, --strict-mcp-config");
+}
+
+// ---------------------------------------------------------------------------
+// App
+// ---------------------------------------------------------------------------
+
+impl App {
+    fn new(config: Config) -> Self {
+        let session = gen_uuid();
+        let nqdir = queue_dir(&session);
+        std::fs::create_dir_all(&nqdir).expect("create NQDIR");
+        Self {
+            jobs: Vec::new(),
+            input: String::new(),
+            cursor: 0,
+            selected: None,
+            nqdir,
+            config,
+            quit: false,
+            job_list_area: Rect::default(),
+            scroll_offset: 0,
+            tail_pids: Arc::new(Mutex::new(Vec::new())),
+        }
+    }
+
+    fn enqueue(&mut self, tx: &mpsc::Sender<Msg>) {
+        let prompt = self.input.trim().to_string();
+        if prompt.is_empty() {
+            return;
+        }
+        self.input.clear();
+        self.cursor = 0;
+
+        let (session_id, parent, depth, turn) = match self.selected {
+            Some(sel) => {
+                let job = &self.jobs[sel];
+                let sid = job.session_id.clone();
+                let t = self.jobs.iter().filter(|j| j.session_id == sid).count() as u64;
+                (sid, Some(sel), (job.depth + 1).min(3), t)
+            }
+            None => (gen_uuid(), None, 0, 0),
+        };
+
+        let mut cmd = Command::new("nq");
+        cmd.env("NQDIR", &self.nqdir);
+        cmd.env("FORCE_COLOR", "1");
+        cmd.arg("claude").arg("-p");
+
+        if parent.is_some() {
+            cmd.arg("--resume").arg(&session_id);
+        } else {
+            cmd.arg("--session-id").arg(&session_id);
+        }
+
+        for arg in &self.config.claude_args {
+            cmd.arg(arg);
+        }
+
+        cmd.arg("--").arg(&prompt);
+
+        let output = match cmd.output() {
+            Ok(o) => o,
+            Err(_) => return,
+        };
+
+        let nq_id = String::from_utf8_lossy(&output.stdout).trim().to_string();
+        if nq_id.is_empty() {
+            return;
+        }
+
+        let idx = self.jobs.len();
+        self.jobs.push(Job {
+            nq_id: nq_id.clone(),
+            session_id,
+            prompt,
+            output: Vec::new(),
+            done: false,
+            parent,
+            depth,
+            _turn: turn,
+        });
+
+        self.selected = Some(idx);
+        self.ensure_visible(idx);
+
+        let nqdir = self.nqdir.clone();
+        let pids = self.tail_pids.clone();
+        let tx = tx.clone();
+        thread::spawn(move || tail_job(idx, nq_id, nqdir, tx, pids));
+    }
+
+    fn handle_msg(&mut self, msg: Msg) {
+        match msg {
+            Msg::Output(idx, line) => {
+                if let Some(job) = self.jobs.get_mut(idx) {
+                    job.output.push(line);
+                }
+            }
+            Msg::Done(idx) => {
+                if let Some(job) = self.jobs.get_mut(idx) {
+                    job.done = true;
+                }
+            }
+            Msg::TailPid(_, _) => {}
+        }
+    }
+
+    fn select_prev(&mut self) {
+        match self.selected {
+            None if !self.jobs.is_empty() => {
+                let last = self.jobs.len() - 1;
+                self.selected = Some(last);
+                self.ensure_visible(last);
+            }
+            Some(0) => {}
+            Some(i) => {
+                self.selected = Some(i - 1);
+                self.ensure_visible(i - 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn select_next(&mut self) {
+        match self.selected {
+            None if !self.jobs.is_empty() => {
+                self.selected = Some(0);
+                self.ensure_visible(0);
+            }
+            Some(i) if i + 1 < self.jobs.len() => {
+                self.selected = Some(i + 1);
+                self.ensure_visible(i + 1);
+            }
+            _ => {}
+        }
+    }
+
+    fn ensure_visible(&mut self, idx: usize) {
+        let h = self.job_list_area.height.saturating_sub(2) as usize;
+        if h == 0 {
+            return;
+        }
+        if idx >= self.scroll_offset + h {
+            self.scroll_offset = idx - h + 1;
+        }
+        if idx < self.scroll_offset {
+            self.scroll_offset = idx;
+        }
+    }
+
+    fn kill_all(&self) {
+        if let Ok(pids) = self.tail_pids.lock() {
+            for pid in pids.iter() {
+                let _ = Command::new("kill")
+                    .args(["-TERM", &pid.to_string()])
+                    .status();
+            }
+        }
+        for job in &self.jobs {
+            if !job.done {
+                if let Some(pid_str) = job.nq_id.rsplit('.').next() {
+                    if let Ok(pid) = pid_str.parse::<u32>() {
+                        let _ = Command::new("kill")
+                            .args(["-TERM", &pid.to_string()])
+                            .status();
+                    }
+                }
+            }
+        }
+    }
+
+    fn running_count(&self) -> usize {
+        self.jobs.iter().filter(|j| !j.done).count()
+    }
+}
+
+// ---------------------------------------------------------------------------
+// Background streaming
+// ---------------------------------------------------------------------------
+
+fn tail_job(
+    idx: usize,
+    nq_id: String,
+    nqdir: PathBuf,
+    tx: mpsc::Sender<Msg>,
+    pids: Arc<Mutex<Vec<u32>>>,
+) {
+    let mut child = match Command::new("nqtail")
+        .arg(&nq_id)
+        .env("NQDIR", &nqdir)
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .spawn()
+    {
+        Ok(c) => c,
+        Err(_) => {
+            let _ = tx.send(Msg::Done(idx));
+            return;
+        }
+    };
+
+    let pid = child.id();
+    if let Ok(mut v) = pids.lock() {
+        v.push(pid);
+    }
+    let _ = tx.send(Msg::TailPid(idx, pid));
+
+    if let Some(stdout) = child.stdout.take() {
+        for line in io::BufReader::new(stdout).lines() {
+            match line {
+                Ok(l) => {
+                    if l.starts_with("==> ") || l.starts_with("exec ") {
+                        continue;
+                    }
+                    if tx.send(Msg::Output(idx, l)).is_err() {
+                        break;
+                    }
+                }
+                Err(_) => break,
+            }
+        }
+    }
+
+    let _ = child.wait();
+    if let Ok(mut v) = pids.lock() {
+        v.retain(|&p| p != pid);
+    }
+    let _ = tx.send(Msg::Done(idx));
+}
+
+// ---------------------------------------------------------------------------
+// TUI rendering
+// ---------------------------------------------------------------------------
+
+fn ui(f: &mut Frame, app: &mut App) {
+    if app.jobs.is_empty() {
+        // No jobs: hint + input
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(f.area());
+
+        let block = Block::default().borders(Borders::ALL).title(" kk ");
+        let inner_h = block.inner(chunks[0]).height as usize;
+        let pad = inner_h.saturating_sub(1) / 2;
+        let mut lines: Vec<Line> = (0..pad).map(|_| Line::raw("")).collect();
+        lines.push(Line::raw("type a prompt below to start"));
+        let para = Paragraph::new(lines)
+            .block(block)
+            .alignment(Alignment::Center);
+        f.render_widget(para, chunks[0]);
+        app.job_list_area = Rect::default();
+        draw_input(f, app, chunks[1]);
+    } else if app.selected.is_some() {
+        // Output (top) + job list (middle) + follow-up input (bottom)
+        let job_list_height = (app.jobs.len() as u16 + 2).min(10);
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(1),
+                Constraint::Length(job_list_height),
+                Constraint::Length(3),
+            ])
+            .split(f.area());
+
+        draw_output(f, app, chunks[0]);
+        draw_job_list(f, app, chunks[1]);
+        draw_input(f, app, chunks[2]);
+    } else {
+        // Job list (top) + new job input (bottom)
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([Constraint::Min(1), Constraint::Length(3)])
+            .split(f.area());
+
+        draw_job_list(f, app, chunks[0]);
+        draw_input(f, app, chunks[1]);
+    }
+}
+
+fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
+    app.job_list_area = area;
+
+    let running = app.running_count();
+    let title = if running > 0 {
+        format!(" jobs ({running} running) ")
+    } else {
+        " jobs ".to_string()
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(Color::Cyan))
+        .title(title);
+    let inner = block.inner(area);
+    f.render_widget(block, area);
+
+    let visible = inner.height as usize;
+    let start = app.scroll_offset;
+    let end = (start + visible).min(app.jobs.len());
+
+    for (i, job) in app.jobs[start..end].iter().enumerate() {
+        let job_idx = start + i;
+        let icon = if job.done { "\u{2713}" } else { "\u{25cf}" };
+        let icon_color = if job.done {
+            Color::DarkGray
+        } else {
+            Color::Green
+        };
+        let indent = "  ".repeat(job.depth.min(3));
+        let connector = if job.parent.is_some() {
+            "\u{21b3} "
+        } else {
+            ""
+        };
+
+        let prefix_len = 1 + indent.len() + connector.len() + icon.len() + 1;
+        let max_w = (inner.width as usize).saturating_sub(prefix_len);
+        let prompt_display: String = if job.prompt.chars().count() > max_w && max_w > 1 {
+            let s: String = job.prompt.chars().take(max_w - 1).collect();
+            format!("{s}\u{2026}")
+        } else {
+            job.prompt.clone()
+        };
+
+        let selected = app.selected == Some(job_idx);
+        let text_style = if selected {
+            Style::default()
+                .fg(Color::Yellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+
+        let line = Line::from(vec![
+            Span::raw(format!(" {indent}{connector}")),
+            Span::styled(icon, Style::default().fg(icon_color)),
+            Span::raw(" "),
+            Span::styled(prompt_display, text_style),
+        ]);
+
+        let y = inner.y + i as u16;
+        if y < inner.y + inner.height {
+            f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
+        }
+    }
+}
+
+fn draw_output(f: &mut Frame, app: &App, area: Rect) {
+    use ansi_to_tui::IntoText;
+
+    let selected_job = match app.selected.and_then(|s| app.jobs.get(s)) {
+        Some(j) => j,
+        None => {
+            f.render_widget(Paragraph::new(""), area);
+            return;
+        }
+    };
+
+    // Combine output from all jobs in this session
+    let session_id = &selected_job.session_id;
+    let mut lines: Vec<Line> = Vec::new();
+    for job in &app.jobs {
+        if job.session_id != *session_id {
+            continue;
+        }
+        // Show prompt
+        lines.push(Line::from(vec![
+            Span::styled(
+                "> ",
+                Style::default()
+                    .fg(Color::Cyan)
+                    .add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(job.prompt.as_str(), Style::default().fg(Color::Cyan)),
+        ]));
+        // Show output, converting ANSI to styled text
+        let combined = job.output.join("\n");
+        if let Ok(text) = combined.as_bytes().into_text() {
+            lines.extend(text.lines);
+        } else {
+            for line in &job.output {
+                lines.push(Line::raw(line.as_str()));
+            }
+        }
+        lines.push(Line::raw(""));
+    }
+
+    let scroll = lines.len().saturating_sub(area.height as usize) as u16;
+    let para = Paragraph::new(lines)
+        .wrap(Wrap { trim: false })
+        .scroll((scroll, 0));
+
+    f.render_widget(para, area);
+}
+
+fn draw_input(f: &mut Frame, app: &App, area: Rect) {
+    let (title, border_color) = match app.selected {
+        Some(sel) if sel < app.jobs.len() => {
+            let sid = &app.jobs[sel].session_id;
+            (format!(" follow-up [{}] > ", &sid[..8]), Color::Yellow)
+        }
+        _ => (" new > ".to_string(), Color::Magenta),
+    };
+
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_style(Style::default().fg(border_color))
+        .title(title);
+    let para = Paragraph::new(app.input.as_str()).block(block);
+    f.render_widget(para, area);
+
+    let x = area.x + 1 + app.cursor as u16;
+    let y = area.y + 1;
+    if x < area.x + area.width - 1 {
+        f.set_cursor_position((x, y));
     }
 }
 
@@ -53,240 +596,80 @@ impl<'a> tracing_subscriber::fmt::MakeWriter<'a> for ChannelMakeWriter {
 // Main
 // ---------------------------------------------------------------------------
 
-#[tokio::main]
-async fn main() -> Result<()> {
-    // Create the log channel before initialising tracing so that all log
-    // events (including startup) are captured by the TUI panel.
-    let (log_tx, log_rx) = mpsc::unbounded_channel::<String>();
-
-    let filter = EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new("info"));
-    tracing_subscriber::fmt()
-        .with_env_filter(filter)
-        .with_target(true)
-        .with_ansi(false) // no ANSI escape codes — ratatui handles styling
-        .with_writer(ChannelMakeWriter(log_tx.clone()))
-        .init();
-
-    let mut kk_config = KkConfig::load()?;
-
-    // Simple manual argument parsing
-    let args: Vec<String> = std::env::args().collect();
-    let mut i = 1;
-    while i < args.len() {
-        match args[i].as_str() {
-            "--agent" if i + 1 < args.len() => {
-                kk_config.agent_type = args[i + 1].clone();
-                i += 2;
-            }
-            "--agent-bin" if i + 1 < args.len() => {
-                kk_config.agent_bin = args[i + 1].clone();
-                i += 2;
-            }
-            _ => i += 1,
-        }
+fn main() {
+    for dep in &["nq", "nqtail", "claude"] {
+        check_dependency(dep);
     }
 
-    // Auto-detect kk-agent sibling (e.g. target/debug/kk-agent next to target/debug/kk).
-    // Falls back to PATH lookup if the sibling doesn't exist.
-    if kk_config.agent_bin == "kk-agent"
-        && let Ok(exe) = std::env::current_exe()
-        && let Some(dir) = exe.parent()
-    {
-        let sibling = dir.join("kk-agent");
-        if sibling.exists() {
-            kk_config.agent_bin = sibling.to_string_lossy().into_owned();
-        }
-    }
+    let config = parse_args();
+    let mut app = App::new(config);
 
-    info!(
-        data_dir = kk_config.data_dir,
-        agent = kk_config.agent_type,
-        agent_bin = kk_config.agent_bin,
-        channels = kk_config.channels.len(),
-        "starting kk"
-    );
+    enable_raw_mode().expect("raw mode");
+    let mut stdout = io::stdout();
+    execute!(stdout, EnterAlternateScreen).expect("setup terminal");
+    let backend = CrosstermBackend::new(stdout);
+    let mut terminal = Terminal::new(backend).expect("terminal");
 
-    // 1. Create data directory structure
-    let paths = DataPaths::new(&kk_config.data_dir);
-    paths.ensure_dirs()?;
+    let original_hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        let _ = disable_raw_mode();
+        let _ = execute!(io::stdout(), LeaveAlternateScreen);
+        original_hook(info);
+    }));
 
-    // 2. Build GatewayConfig from kk.yaml values
-    let gw_config = build_gateway_config(&kk_config);
+    let (tx, rx) = mpsc::channel::<Msg>();
 
-    // 3. Create local launcher — forward kk-agent logs to the TUI panel
-    let launcher: Arc<dyn Launcher> = Arc::new(LocalLauncher::new(
-        &kk_config.agent_bin,
-        &kk_config.data_dir,
-        Some(log_tx),
-    ));
-
-    // 4. Build shared state
-    let state = SharedState::new(gw_config, launcher, &paths)?;
-
-    // File-based recovery
-    if let Err(e) = state.rebuild_active_jobs_from_files().await {
-        warn!(error = %e, "failed to rebuild active jobs from files");
-    }
-
-    // 5. Register terminal channel in groups.d
-    terminal::register_terminal_group(&paths)?;
-
-    // 6. Spawn connector child processes
-    let mut connector_children = Vec::new();
-    for channel in &kk_config.channels {
-        match spawn_connector(&kk_config, channel, &paths) {
-            Ok(child) => {
-                info!(channel = channel.name, pid = ?child.id(), "spawned connector");
-                connector_children.push((channel.name.clone(), child));
-            }
-            Err(e) => {
-                error!(channel = channel.name, error = %e, "failed to spawn connector");
-            }
-        }
-    }
-
-    // 7. Archive any completed terminal sessions left over from a previous
-    // (killed) run, before the results loop starts. Without this the loop
-    // would re-deliver their responses into the fresh TUI via the outbox.
-    terminal::archive_orphaned_sessions(&paths);
-
-    // 8. Run gateway loops in-process
-    let inbound = tokio::spawn(loops::inbound::run(state.clone()));
-    let results = tokio::spawn(loops::results::run(state.clone()));
-    let cleanup = tokio::spawn(loops::cleanup::run(state.clone()));
-    let state_reload = tokio::spawn(loops::state_reload::run(state.clone()));
-
-    // 9. Spawn connector watchdog (restarts crashed connectors)
-    let watchdog = tokio::spawn(watch_connectors(
-        connector_children,
-        kk_config,
-        paths.clone(),
-    ));
-
-    // 10. Run TUI terminal connector in-process
-    let terminal = tokio::spawn(terminal::run(paths, log_rx));
-
-    // 11. Wait for shutdown or crash
-    tokio::select! {
-        _ = tokio::signal::ctrl_c() => {
-            info!("received Ctrl+C, shutting down");
-        }
-        res = terminal => {
-            info!("terminal exited: {:?}", res);
-        }
-        res = inbound => {
-            error!("inbound loop exited: {:?}", res);
-        }
-        res = results => {
-            error!("results loop exited: {:?}", res);
-        }
-        res = cleanup => {
-            error!("cleanup loop exited: {:?}", res);
-        }
-        res = state_reload => {
-            error!("state reload loop exited: {:?}", res);
-        }
-        res = watchdog => {
-            error!("connector watchdog exited: {:?}", res);
-        }
-    }
-
-    Ok(())
-}
-
-fn spawn_connector(
-    kk_config: &KkConfig,
-    channel: &config::ChannelConfig,
-    paths: &DataPaths,
-) -> Result<tokio::process::Child> {
-    // Ensure outbox/stream dirs exist for this channel
-    std::fs::create_dir_all(paths.outbox_dir(&channel.name))?;
-    std::fs::create_dir_all(paths.stream_dir(&channel.name))?;
-
-    let mut cmd = Command::new("kk-connector");
-    cmd.kill_on_drop(true);
-    cmd.env("CHANNEL_TYPE", &channel.channel_type)
-        .env("CHANNEL_NAME", &channel.name)
-        .env("INBOUND_DIR", paths.inbound_dir())
-        .env("OUTBOX_DIR", paths.outbox_dir(&channel.name))
-        .env("STREAM_DIR", paths.stream_dir(&channel.name))
-        .env(
-            "GROUPS_D_FILE",
-            paths.groups_d_dir().join(format!("{}.json", channel.name)),
-        )
-        .env("DATA_DIR", &kk_config.data_dir);
-
-    // Pass through channel-specific env vars (tokens, etc.)
-    for (key, value) in &channel.env {
-        cmd.env(key, value);
-    }
-
-    Ok(cmd.spawn()?)
-}
-
-/// Watch connector child processes; restart any that crash.
-async fn watch_connectors(
-    mut children: Vec<(String, tokio::process::Child)>,
-    config: KkConfig,
-    paths: DataPaths,
-) {
     loop {
-        tokio::time::sleep(tokio::time::Duration::from_secs(5)).await;
+        terminal.draw(|f| ui(f, &mut app)).expect("draw");
 
-        let mut i = 0;
-        while i < children.len() {
-            let (ref name, ref mut child) = children[i];
-            match child.try_wait() {
-                Ok(Some(status)) => {
-                    warn!(
-                        channel = name.as_str(),
-                        status = %status,
-                        "connector exited, restarting"
-                    );
-                    if let Some(ch_config) = config.channels.iter().find(|c| c.name == *name) {
-                        match spawn_connector(&config, ch_config, &paths) {
-                            Ok(new_child) => {
-                                info!(channel = name.as_str(), pid = ?new_child.id(), "restarted connector");
-                                children[i].1 = new_child;
-                            }
-                            Err(e) => {
-                                error!(channel = name.as_str(), error = %e, "failed to restart connector");
-                            }
+        while let Ok(msg) = rx.try_recv() {
+            app.handle_msg(msg);
+        }
+
+        if event::poll(Duration::from_millis(30)).unwrap_or(false) {
+            if let Ok(Event::Key(key)) = event::read() {
+                match (key.code, key.modifiers) {
+                    (KeyCode::Char('c'), KeyModifiers::CONTROL)
+                    | (KeyCode::Char('d'), KeyModifiers::CONTROL) => {
+                        app.quit = true;
+                    }
+                    (KeyCode::Enter, _) => app.enqueue(&tx),
+                    (KeyCode::Esc, _) => app.selected = None,
+                    (KeyCode::Up, _) => app.select_prev(),
+                    (KeyCode::Down, _) => app.select_next(),
+                    (KeyCode::Left, _) => {
+                        if app.cursor > 0 {
+                            app.cursor -= 1;
                         }
                     }
-                }
-                Ok(None) => {}
-                Err(e) => {
-                    warn!(channel = name.as_str(), error = %e, "error checking connector status");
+                    (KeyCode::Right, _) => {
+                        if app.cursor < app.input.len() {
+                            app.cursor += 1;
+                        }
+                    }
+                    (KeyCode::Backspace, _) => {
+                        if app.cursor > 0 {
+                            app.input.remove(app.cursor - 1);
+                            app.cursor -= 1;
+                        }
+                    }
+                    (KeyCode::Char(c), _) => {
+                        app.input.insert(app.cursor, c);
+                        app.cursor += 1;
+                    }
+                    _ => {}
                 }
             }
-            i += 1;
+        }
+
+        if app.quit {
+            break;
         }
     }
-}
 
-/// Map kk.yaml fields to GatewayConfig.
-fn build_gateway_config(kk: &KkConfig) -> GatewayConfig {
-    GatewayConfig {
-        data_dir: kk.data_dir.clone(),
-        namespace: "local".into(),
-        image_agent: String::new(),
-        api_keys_secret: String::new(),
-        job_active_deadline: 0,
-        job_ttl_after_finished: 300,
-        job_idle_timeout: kk.idle_timeout,
-        job_max_turns: kk.max_turns,
-        job_cpu_request: String::new(),
-        job_cpu_limit: String::new(),
-        job_memory_request: String::new(),
-        job_memory_limit: String::new(),
-        inbound_poll_interval_ms: 200,
-        results_poll_interval_ms: 200,
-        cleanup_interval_ms: 60000,
-        stale_message_timeout: 300,
-        results_archive_ttl: 86400,
-        pvc_claim_name: String::new(),
-        state_reload_interval_ms: 30000,
-        agent_type: kk.agent_type.clone(),
-    }
+    app.kill_all();
+    let _ = disable_raw_mode();
+    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
+    let _ = terminal.show_cursor();
+    let _ = std::fs::remove_dir_all(&app.nqdir);
 }
