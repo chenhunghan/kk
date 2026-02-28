@@ -30,14 +30,11 @@ enum Msg {
 }
 
 struct Job {
-    nq_id: String,
+    nq_ids: Vec<String>,
     session_id: String,
     prompt: String,
     output: Vec<String>,
-    done: bool,
-    parent: Option<usize>,
-    depth: usize,
-    _turn: u64,
+    active_tails: usize,
 }
 
 struct Config {
@@ -206,14 +203,11 @@ impl App {
         self.input.clear();
         self.cursor = 0;
 
-        let (session_id, parent, depth, turn) = match self.selected {
-            Some(sel) => {
-                let job = &self.jobs[sel];
-                let sid = job.session_id.clone();
-                let t = self.jobs.iter().filter(|j| j.session_id == sid).count() as u64;
-                (sid, Some(sel), (job.depth + 1).min(3), t)
-            }
-            None => (gen_uuid(), None, 0, 0),
+        let is_followup = self.selected.is_some();
+        let session_id = if is_followup {
+            self.jobs[self.selected.unwrap()].session_id.clone()
+        } else {
+            gen_uuid()
         };
 
         let mut cmd = Command::new("nq");
@@ -221,7 +215,7 @@ impl App {
         cmd.env("FORCE_COLOR", "1");
         cmd.arg("claude").arg("-p");
 
-        if parent.is_some() {
+        if is_followup {
             cmd.arg("--resume").arg(&session_id);
         } else {
             cmd.arg("--session-id").arg(&session_id);
@@ -243,20 +237,27 @@ impl App {
             return;
         }
 
-        let idx = self.jobs.len();
-        self.jobs.push(Job {
-            nq_id: nq_id.clone(),
-            session_id,
-            prompt,
-            output: Vec::new(),
-            done: false,
-            parent,
-            depth,
-            _turn: turn,
-        });
-
-        self.selected = Some(idx);
-        self.ensure_visible(idx);
+        let idx = if let Some(sel) = self.selected {
+            // Follow-up: append to existing job
+            let job = &mut self.jobs[sel];
+            job.nq_ids.push(nq_id.clone());
+            job.active_tails += 1;
+            job.output.push(format!("\x1b[1;36m> {prompt}\x1b[0m"));
+            sel
+        } else {
+            // New job
+            let idx = self.jobs.len();
+            self.jobs.push(Job {
+                nq_ids: vec![nq_id.clone()],
+                session_id,
+                prompt: prompt.clone(),
+                output: vec![format!("\x1b[1;36m> {prompt}\x1b[0m")],
+                active_tails: 1,
+            });
+            self.selected = Some(idx);
+            self.ensure_visible(idx);
+            idx
+        };
 
         let nqdir = self.nqdir.clone();
         let pids = self.tail_pids.clone();
@@ -273,7 +274,7 @@ impl App {
             }
             Msg::Done(idx) => {
                 if let Some(job) = self.jobs.get_mut(idx) {
-                    job.done = true;
+                    job.active_tails = job.active_tails.saturating_sub(1);
                 }
             }
             Msg::TailPid(_, _) => {}
@@ -332,12 +333,14 @@ impl App {
             }
         }
         for job in &self.jobs {
-            if !job.done {
-                if let Some(pid_str) = job.nq_id.rsplit('.').next() {
-                    if let Ok(pid) = pid_str.parse::<u32>() {
-                        let _ = Command::new("kill")
-                            .args(["-TERM", &pid.to_string()])
-                            .status();
+            if job.active_tails > 0 {
+                for nq_id in &job.nq_ids {
+                    if let Some(pid_str) = nq_id.rsplit('.').next() {
+                        if let Ok(pid) = pid_str.parse::<u32>() {
+                            let _ = Command::new("kill")
+                                .args(["-TERM", &pid.to_string()])
+                                .status();
+                        }
                     }
                 }
             }
@@ -345,7 +348,7 @@ impl App {
     }
 
     fn running_count(&self) -> usize {
-        self.jobs.iter().filter(|j| !j.done).count()
+        self.jobs.iter().filter(|j| j.active_tails > 0).count()
     }
 }
 
@@ -476,21 +479,11 @@ fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
 
     for (i, job) in app.jobs[start..end].iter().enumerate() {
         let job_idx = start + i;
-        let icon = if job.done { "\u{2713}" } else { "\u{25cf}" };
-        let icon_color = if job.done {
-            Color::DarkGray
-        } else {
-            Color::Green
-        };
-        let indent = "  ".repeat(job.depth.min(3));
-        let connector = if job.parent.is_some() {
-            "\u{21b3} "
-        } else {
-            ""
-        };
+        let done = job.active_tails == 0;
+        let icon = if done { "\u{2713}" } else { "\u{25cf}" };
+        let icon_color = if done { Color::DarkGray } else { Color::Green };
 
-        let prefix_len = 1 + indent.len() + connector.len() + icon.len() + 1;
-        let max_w = (inner.width as usize).saturating_sub(prefix_len);
+        let max_w = (inner.width as usize).saturating_sub(4); // " X prompt"
         let prompt_display: String = if job.prompt.chars().count() > max_w && max_w > 1 {
             let s: String = job.prompt.chars().take(max_w - 1).collect();
             format!("{s}\u{2026}")
@@ -508,7 +501,7 @@ fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
         };
 
         let line = Line::from(vec![
-            Span::raw(format!(" {indent}{connector}")),
+            Span::raw(" "),
             Span::styled(icon, Style::default().fg(icon_color)),
             Span::raw(" "),
             Span::styled(prompt_display, text_style),
@@ -524,7 +517,7 @@ fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
 fn draw_output(f: &mut Frame, app: &App, area: Rect) {
     use ansi_to_tui::IntoText;
 
-    let selected_job = match app.selected.and_then(|s| app.jobs.get(s)) {
+    let job = match app.selected.and_then(|s| app.jobs.get(s)) {
         Some(j) => j,
         None => {
             f.render_widget(Paragraph::new(""), area);
@@ -532,37 +525,14 @@ fn draw_output(f: &mut Frame, app: &App, area: Rect) {
         }
     };
 
-    // Combine output from all jobs in this session
-    let session_id = &selected_job.session_id;
-    let mut lines: Vec<Line> = Vec::new();
-    for job in &app.jobs {
-        if job.session_id != *session_id {
-            continue;
-        }
-        // Show prompt
-        lines.push(Line::from(vec![
-            Span::styled(
-                "> ",
-                Style::default()
-                    .fg(Color::Cyan)
-                    .add_modifier(Modifier::BOLD),
-            ),
-            Span::styled(job.prompt.as_str(), Style::default().fg(Color::Cyan)),
-        ]));
-        // Show output, converting ANSI to styled text
-        let combined = job.output.join("\n");
-        if let Ok(text) = combined.as_bytes().into_text() {
-            lines.extend(text.lines);
-        } else {
-            for line in &job.output {
-                lines.push(Line::raw(line.as_str()));
-            }
-        }
-        lines.push(Line::raw(""));
-    }
-
-    let scroll = lines.len().saturating_sub(area.height as usize) as u16;
-    let para = Paragraph::new(lines)
+    let combined = job.output.join("\n");
+    let text = combined
+        .as_bytes()
+        .into_text()
+        .unwrap_or_else(|_| ratatui::text::Text::raw(&combined));
+    let line_count = text.lines.len();
+    let scroll = line_count.saturating_sub(area.height as usize) as u16;
+    let para = Paragraph::new(text)
         .wrap(Wrap { trim: false })
         .scroll((scroll, 0));
 
