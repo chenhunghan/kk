@@ -196,14 +196,25 @@ impl App {
     }
 
     fn enqueue(&mut self, tx: &mpsc::Sender<Msg>) {
-        let prompt = self.input.trim().to_string();
-        if prompt.is_empty() {
+        let raw = self.input.trim().to_string();
+        if raw.is_empty() {
             return;
         }
         self.input.clear();
         self.cursor = 0;
 
-        let is_followup = self.selected.is_some();
+        // /new or /new "prompt" forces a new job
+        let (force_new, prompt) = if raw == "/new" {
+            // bare /new with no prompt — just deselect
+            self.selected = None;
+            return;
+        } else if let Some(rest) = raw.strip_prefix("/new ") {
+            (true, rest.trim().to_string())
+        } else {
+            (false, raw)
+        };
+
+        let is_followup = self.selected.is_some() && !force_new;
         let session_id = if is_followup {
             self.jobs[self.selected.unwrap()].session_id.clone()
         } else {
@@ -237,7 +248,8 @@ impl App {
             return;
         }
 
-        let idx = if let Some(sel) = self.selected {
+        let idx = if is_followup {
+            let sel = self.selected.unwrap();
             // Follow-up: append to existing job
             let job = &mut self.jobs[sel];
             job.nq_ids.push(nq_id.clone());
@@ -548,10 +560,17 @@ fn draw_input(f: &mut Frame, app: &App, area: Rect) {
         _ => (" new > ".to_string(), Color::Magenta),
     };
 
-    let block = Block::default()
+    let mut block = Block::default()
         .borders(Borders::ALL)
         .border_style(Style::default().fg(border_color))
         .title(title);
+    if app.selected.is_some() {
+        block = block.title_bottom(
+            Line::from(" /new to start a new job ")
+                .style(Style::default().fg(Color::DarkGray))
+                .right_aligned(),
+        );
+    }
     let para = Paragraph::new(app.input.as_str()).block(block);
     f.render_widget(para, area);
 
