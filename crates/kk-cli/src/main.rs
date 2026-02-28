@@ -7,33 +7,30 @@ use std::thread;
 use std::time::Duration;
 
 use crossterm::event::{self, Event, KeyCode, KeyModifiers};
-use crossterm::execute;
-use crossterm::terminal::{
-    disable_raw_mode, enable_raw_mode, EnterAlternateScreen, LeaveAlternateScreen,
-};
+use crossterm::terminal::{disable_raw_mode, enable_raw_mode};
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
-use ratatui::{Frame, Terminal};
+use ratatui::widgets::{Block, Borders, Paragraph};
+use ratatui::{Frame, Terminal, TerminalOptions, Viewport};
 
 // ---------------------------------------------------------------------------
 // Data model
 // ---------------------------------------------------------------------------
 
-#[allow(dead_code)]
 enum Msg {
     Output(usize, String),
     Done(usize),
+    #[allow(dead_code)]
     TailPid(usize, u32),
 }
 
 struct Job {
     nq_ids: Vec<String>,
     session_id: String,
+    #[allow(dead_code)]
     prompt: String,
-    output: Vec<String>,
     active_tails: usize,
 }
 
@@ -51,6 +48,7 @@ struct App {
     quit: bool,
     job_list_area: Rect,
     scroll_offset: usize,
+    pending_lines: Vec<String>,
     tail_pids: Arc<Mutex<Vec<u32>>>,
 }
 
@@ -191,6 +189,7 @@ impl App {
             quit: false,
             job_list_area: Rect::default(),
             scroll_offset: 0,
+            pending_lines: Vec::new(),
             tail_pids: Arc::new(Mutex::new(Vec::new())),
         }
     }
@@ -223,7 +222,6 @@ impl App {
 
         let mut cmd = Command::new("nq");
         cmd.env("NQDIR", &self.nqdir);
-        cmd.env("FORCE_COLOR", "1");
         cmd.arg("claude").arg("-p");
 
         if is_followup {
@@ -250,24 +248,22 @@ impl App {
 
         let idx = if is_followup {
             let sel = self.selected.unwrap();
-            // Follow-up: append to existing job
             let job = &mut self.jobs[sel];
             job.nq_ids.push(nq_id.clone());
             job.active_tails += 1;
-            job.output.push(format!("\x1b[1;36m> {prompt}\x1b[0m"));
+            self.pending_lines.push(format!("> {prompt}"));
             sel
         } else {
-            // New job
             let idx = self.jobs.len();
             self.jobs.push(Job {
                 nq_ids: vec![nq_id.clone()],
                 session_id,
                 prompt: prompt.clone(),
-                output: vec![format!("\x1b[1;36m> {prompt}\x1b[0m")],
                 active_tails: 1,
             });
             self.selected = Some(idx);
             self.ensure_visible(idx);
+            self.pending_lines.push(format!("> {prompt}"));
             idx
         };
 
@@ -280,8 +276,8 @@ impl App {
     fn handle_msg(&mut self, msg: Msg) {
         match msg {
             Msg::Output(idx, line) => {
-                if let Some(job) = self.jobs.get_mut(idx) {
-                    job.output.push(line);
+                if idx < self.jobs.len() {
+                    self.pending_lines.push(line);
                 }
             }
             Msg::Done(idx) => {
@@ -423,49 +419,14 @@ fn tail_job(
 // ---------------------------------------------------------------------------
 
 fn ui(f: &mut Frame, app: &mut App) {
-    if app.jobs.is_empty() {
-        // No jobs: hint + input
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
-            .split(f.area());
+    // Job list takes remaining space, input bar fixed at 3 lines
+    let chunks = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Min(1), Constraint::Length(3)])
+        .split(f.area());
 
-        let block = Block::default().borders(Borders::ALL).title(" kk ");
-        let inner_h = block.inner(chunks[0]).height as usize;
-        let pad = inner_h.saturating_sub(1) / 2;
-        let mut lines: Vec<Line> = (0..pad).map(|_| Line::raw("")).collect();
-        lines.push(Line::raw("type a prompt below to start"));
-        let para = Paragraph::new(lines)
-            .block(block)
-            .alignment(Alignment::Center);
-        f.render_widget(para, chunks[0]);
-        app.job_list_area = Rect::default();
-        draw_input(f, app, chunks[1]);
-    } else if app.selected.is_some() {
-        // Output (top) + job list (middle) + follow-up input (bottom)
-        let job_list_height = (app.jobs.len() as u16 + 2).min(10);
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(1),
-                Constraint::Length(job_list_height),
-                Constraint::Length(3),
-            ])
-            .split(f.area());
-
-        draw_output(f, app, chunks[0]);
-        draw_job_list(f, app, chunks[1]);
-        draw_input(f, app, chunks[2]);
-    } else {
-        // Job list (top) + new job input (bottom)
-        let chunks = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([Constraint::Min(1), Constraint::Length(3)])
-            .split(f.area());
-
-        draw_job_list(f, app, chunks[0]);
-        draw_input(f, app, chunks[1]);
-    }
+    draw_job_list(f, app, chunks[0]);
+    draw_input(f, app, chunks[1]);
 }
 
 fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
@@ -495,7 +456,7 @@ fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
         let icon = if done { "\u{2713}" } else { "\u{25cf}" };
         let icon_color = if done { Color::DarkGray } else { Color::Green };
 
-        let max_w = (inner.width as usize).saturating_sub(4); // " X prompt"
+        let max_w = (inner.width as usize).saturating_sub(4);
         let prompt_display: String = if job.prompt.chars().count() > max_w && max_w > 1 {
             let s: String = job.prompt.chars().take(max_w - 1).collect();
             format!("{s}\u{2026}")
@@ -524,31 +485,6 @@ fn draw_job_list(f: &mut Frame, app: &mut App, area: Rect) {
             f.render_widget(Paragraph::new(line), Rect::new(inner.x, y, inner.width, 1));
         }
     }
-}
-
-fn draw_output(f: &mut Frame, app: &App, area: Rect) {
-    use ansi_to_tui::IntoText;
-
-    let job = match app.selected.and_then(|s| app.jobs.get(s)) {
-        Some(j) => j,
-        None => {
-            f.render_widget(Paragraph::new(""), area);
-            return;
-        }
-    };
-
-    let combined = job.output.join("\n");
-    let text = combined
-        .as_bytes()
-        .into_text()
-        .unwrap_or_else(|_| ratatui::text::Text::raw(&combined));
-    let line_count = text.lines.len();
-    let scroll = line_count.saturating_sub(area.height as usize) as u16;
-    let para = Paragraph::new(text)
-        .wrap(Wrap { trim: false })
-        .scroll((scroll, 0));
-
-    f.render_widget(para, area);
 }
 
 fn draw_input(f: &mut Frame, app: &App, area: Rect) {
@@ -594,26 +530,45 @@ fn main() {
     let mut app = App::new(config);
 
     enable_raw_mode().expect("raw mode");
-    let mut stdout = io::stdout();
-    execute!(stdout, EnterAlternateScreen).expect("setup terminal");
+    let stdout = io::stdout();
     let backend = CrosstermBackend::new(stdout);
-    let mut terminal = Terminal::new(backend).expect("terminal");
+    let mut terminal = Terminal::with_options(
+        backend,
+        TerminalOptions {
+            viewport: Viewport::Inline(8),
+        },
+    )
+    .expect("terminal");
 
     let original_hook = std::panic::take_hook();
     std::panic::set_hook(Box::new(move |info| {
         let _ = disable_raw_mode();
-        let _ = execute!(io::stdout(), LeaveAlternateScreen);
         original_hook(info);
     }));
 
     let (tx, rx) = mpsc::channel::<Msg>();
 
     loop {
-        terminal.draw(|f| ui(f, &mut app)).expect("draw");
-
         while let Ok(msg) = rx.try_recv() {
             app.handle_msg(msg);
         }
+
+        // Flush completed lines to terminal scrollback
+        if !app.pending_lines.is_empty() {
+            let all_lines: Vec<Line> = app.pending_lines.drain(..).map(Line::raw).collect();
+            if !all_lines.is_empty() {
+                let count = all_lines.len() as u16;
+                let _ = terminal.insert_before(count, |buf| {
+                    for (i, line) in all_lines.into_iter().enumerate() {
+                        if (i as u16) < buf.area.height {
+                            buf.set_line(buf.area.x, buf.area.y + i as u16, &line, buf.area.width);
+                        }
+                    }
+                });
+            }
+        }
+
+        terminal.draw(|f| ui(f, &mut app)).expect("draw");
 
         if event::poll(Duration::from_millis(30)).unwrap_or(false) {
             if let Ok(Event::Key(key)) = event::read() {
@@ -658,7 +613,6 @@ fn main() {
 
     app.kill_all();
     let _ = disable_raw_mode();
-    let _ = execute!(terminal.backend_mut(), LeaveAlternateScreen);
     let _ = terminal.show_cursor();
     let _ = std::fs::remove_dir_all(&app.nqdir);
 }
